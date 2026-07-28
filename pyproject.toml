@@ -1,0 +1,36 @@
+[project]
+name = "RNAGenScape"
+version = "0.1.0"
+description = "Property-guided optimized generation of mRNA sequences with manifold Langevin dynamics"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anndata>=0.11.4",
+    "einops>=0.8.1",
+    "ipykernel>=6.29.5",
+    "matplotlib>=3.10.3",
+    "multimolecule>=0.0.8",
+    "numpy>=1.26",
+    "pandas>=2.3.1",
+    "phate>=1.0.11",
+    "pot>=0.9.5",
+    "scikit-learn>=1.7.0",
+    "torch>=2.7.1",
+    "torch-geometric>=2.6.1",
+    "torch-scatter>=2.1.2",
+    "torchaudio>=2.7.1",
+    "torchdiffeq>=0.2.5",
+    "torchvision>=0.22.1",
+    "tqdm>=4.67.1",
+    "transformers==4.46.3",
+    "viennarna>=2.7.0",
+    "xformers>=0.0.31.post1",
+]
+
+# torch-scatter is built from source on this cluster (PyG wheels need newer glibc).
+# Build only (do NOT leave GCC/12 loaded when running Python — it breaks torch_scatter/ABI):
+#   module load GCC/12.2.0 CUDA/12.2.2
+#   UV_HTTP_TIMEOUT=600 CXX=$(which g++) CC=$(which gcc) uv sync --python 3.12
+#   module unload GCC
+[tool.uv.extra-build-dependencies]
+torch-scatter = ["torch", "numpy"]

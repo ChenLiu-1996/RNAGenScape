@@ -1,0 +1,24 @@
+.DS_Store
+.vscode
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Local data and run artifacts (keep data on disk; do not commit)
+data/
+results/
+*.out
+
+# Model / array dumps
+*.pt
+*.pth
+*.pth.tar
+*.pkl
+*.npy
+*.npz
+*.h5
+*.png
+*.ckpt
