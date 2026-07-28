@@ -4,15 +4,13 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-RNAGenScape-firebrick)](https://arxiv.org/pdf/2510.24736)
 
-RNAGenScape learns a structured latent space over mRNA sequences (via a joint autoencoder–regressor), then optimizes a continuous property with **on-manifold Langevin dynamics**. Off-manifold steps are retracted with a denoising autoencoder (or kNN), optionally densified by SUGAR, and decoded back to sequences. Final scoring uses a separate oracle (UTR-LM or a Conv1d regressor), not the guidance head.
-
-This repository is being rebuilt from the research codebase (`mRNA-translation`) with a cleaner layout, coherent experiment pipelines, and more rigorous evaluation. Source code will land in subsequent migration steps.
+Generating property-optimized mRNA sequences is central to applications such as vaccine design and protein replacement therapy, but remains challenging: viable sequences occupy a narrow subset of sequence space, data are limited, and unconstrained edits often yield nonfunctional transcripts. RNAGenScape addresses this with property-guided manifold Langevin dynamics that optimize sequences while staying on a learned manifold of real data. It combines three components: (1) an organized autoencoder (OAE) that jointly learns sequence reconstruction and property prediction, (2) a manifold projector that maps updates back onto the data manifold, and (3) property-guided Langevin dynamics that refine latent embeddings under this constraint. The result is local, guided optimization that improves target properties while preserving biological viability.
 
 ---
 
 ## Environment
 
-Requires [uv](https://docs.astral.sh/uv/) and Python ≥ 3.12.
+Requires [uv](https://docs.astral.sh/uv/) and Python >= 3.12.
 
 ```bash
 cd /path/to/RNAGenScape
@@ -40,28 +38,22 @@ module unload GCC
 
 Datasets live under `data/` (gitignored; present on disk after setup).
 
-| Directory | Contents | Primary use |
-|-----------|----------|-------------|
-| `data/Zebrafish/` | MPRA 5′ UTR translation CSVs | Translation efficiency |
-| `data/OpenVaccine/` | OpenVaccine sequences + reactivity | Reactivity optimization |
-| `data/Ribosome_loading/` | MRL / TE libraries (incl. fixed train–test splits) | Ribosome load / TE |
-
 **Primary experiment files:**
 
-- Zebrafish: `MPRA_mean_translation_2hpf_pa_Fish5UTR.csv` (and related MPRA variants)
-- OpenVaccine: `train.csv`
-- Ribosome loading: Mengdi GSM3130438 train/test CSVs (e.g. `egfp_pseudo` library)
+- OpenVaccine: ~2k samples
+- Zebrafish: ~55k samples
+- Ribosome loading: ~260k samples
 
 ---
 
 ## Method overview
 
-1. **Train** an `OrganizedAE` (reconstruction + property regression).
-2. **Fit** a manifold projector on AE latents (DAE or kNN), optionally with SUGAR densification.
-3. **Walk** with fitness-guided manifold Langevin (MFD-ULA) and decode to sequences.
-4. **Evaluate** generated sequences with a held-out-style oracle (UTR-LM or Conv1d).
+The same procedure is used for each dataset (train / val / test split):
 
-Training, generation, and evaluation CLIs will be documented here once the package layout is in place.
+1. **Oracle.** Fine-tune (or load) a property predictor and check it on the held-out test set. This model is used only for final evaluation, not for guiding generation.
+2. **Train RNAGenScape.** Fit the OAE on the training and validation sets (SUGAR to hole-fill the sparse manifolds). Train the manifold projector if it is a parameterized by a learnable DAE module (skip if using a kNN projector).
+3. **Generate.** Encode unseen test sequences, run fitness-guided Langevin in latent space with periodic manifold projection, and decode to new sequences.
+4. **Evaluate.** Score start vs. generated sequences with the frozen oracle (property improvement and related metrics).
 
 ---
 
@@ -70,5 +62,10 @@ Training, generation, and evaluation CLIs will be documented here once the packa
 If you use RNAGenScape, please cite the paper:
 
 ```
-https://arxiv.org/pdf/2510.24736
+@article{liao2025rnagenscape,
+  title={RNAGenScape: Property-Guided, Optimized Generation of mRNA Sequences with Manifold Langevin Dynamics},
+  author={Liao, Danqi and Liu, Chen and Sun, Xingzhi and Tang, Di{\'e} and Wang, Haochen and Youlten, Scott and Gopinath, Srikar Krishna and Lee, Haejeong and Strayer, Ethan C and Giraldez, Antonio J and others},
+  journal={arXiv preprint arXiv:2510.24736},
+  year={2025}
+}
 ```
