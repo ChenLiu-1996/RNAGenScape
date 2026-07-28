@@ -22,7 +22,7 @@ uv sync --python 3.12
 source .venv/bin/activate
 ```
 
-### Cluster note (McCleary / PyG)
+### Cluster note (Misha / PyG)
 
 `torch-scatter` is built from source on clusters with older glibc. Load a newer GCC **only while building**, then unload it before running Python (leaving GCC loaded can break the torch_scatter ABI):
 
