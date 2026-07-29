@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 # Allow `python oracle.py` / `python src/utils/oracle.py`.
 _SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -12,31 +12,12 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 import numpy as np
-import pandas as pd
 import torch
 
+from dataset import DATASET_CONFIG
+from dataset.data_io import data_path, read_sequences_and_labels
 from utils.metrics import VOCAB_SIZE, decode_token_ids, to_token_ids
-from utils.results import repo_root, results_root
-
-
-# Dataset registry for evaluation (paths under data/).
-DATASET_CONFIG: Dict[str, dict] = {
-    "Zebrafish": {
-        "relative_csv": "Zebrafish/MPRA_mean_translation_2hpf_pa_Fish5UTR.csv",
-        "seq_key": "sequence",
-        "seq_len": 124,
-    },
-    "OpenVaccine": {
-        "relative_csv": "OpenVaccine/train.csv",
-        "seq_key": "sequence",
-        "seq_len": 107,
-    },
-    "Ribosome_loading": {
-        "relative_csv": "Ribosome_loading/MRL_Random50Nuc_SynthesisLibrary_Sample/4.10_train_data_GSM3130438_egfp_pseudo_2.csv",
-        "seq_key": "utr",
-        "seq_len": 50,
-    },
-}
+from utils.results import results_root
 
 # Frozen zero-shot validators only — never enter train_oracle.py.
 FROZEN_HF_ORACLES = frozenset({"UTRLM_TE", "UTRLM_MRL"})
@@ -59,9 +40,9 @@ def load_train_token_ids(dataset: str) -> torch.Tensor:
     if dataset not in DATASET_CONFIG:
         raise KeyError(f"Unknown dataset '{dataset}'. Choose from {list(DATASET_CONFIG)}")
     cfg = DATASET_CONFIG[dataset]
-    csv_path = os.path.join(repo_root(), "data", cfg["relative_csv"])
-    df = pd.read_csv(csv_path)
-    seqs = df[cfg["seq_key"]].astype(str).tolist()
+    seqs, _ = read_sequences_and_labels(
+        data_path(cfg["relative_csv"]), cfg["seq_key"], cfg["label_key"]
+    )
     return to_token_ids(seqs)
 
 

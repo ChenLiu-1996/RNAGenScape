@@ -16,7 +16,7 @@ _SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from utils.oracle import DATASET_CONFIG
+from dataset import DATASET_CONFIG
 
 
 def parse_args():

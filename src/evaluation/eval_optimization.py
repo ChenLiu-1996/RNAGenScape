@@ -23,8 +23,8 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from utils.metrics import optimization_metrics
+from dataset import DATASET_CONFIG
 from utils.oracle import (
-    DATASET_CONFIG,
     SUPPORTED_ORACLES,
     load_oracle,
     load_train_token_ids,
