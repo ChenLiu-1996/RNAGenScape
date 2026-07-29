@@ -34,6 +34,20 @@ module unload GCC
 
 ---
 
+## Pretrained UTR-LM weights
+
+Oracle training for `UTRLM` starts from the official pre-trained checkpoint (not domain-specific fine-tuned versions). Download:
+
+```bash
+mkdir -p checkpoints/utrlm
+curl -L -o checkpoints/utrlm/utrlm_pretrained_siss_ep93.pkl \
+  "https://raw.githubusercontent.com/a96123155/UTR-LM/main/Model/Pretrained/ESM2SISS_FS4.1_fiveSpeciesCao_6layers_16heads_128embedsize_4096batchToks_lr1e-05_supervisedweight1.0_structureweight1.0_MLMLossMin_epoch93.pkl"
+```
+
+Source: [a96123155/UTR-LM](https://github.com/a96123155/UTR-LM/tree/main/Model/Pretrained).
+
+---
+
 ## Data
 
 Datasets live under `data/` (gitignored; present on disk after setup).
