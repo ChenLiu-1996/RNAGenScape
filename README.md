@@ -56,7 +56,7 @@ Datasets live under `data/` (gitignored; present on disk after setup).
 
 - OpenVaccine: ~2k samples
 - Zebrafish: ~55k samples
-- Ribosome loading: ~260k samples
+- RibosomeLoading: ~260k samples
 
 ---
 

@@ -2,7 +2,7 @@
 
 Example:
   python src/evaluation/eval_gradient.py \\
-    --dataset Ribosome_loading \\
+    --dataset RibosomeLoading \\
     --model OAE
 """
 

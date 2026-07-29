@@ -24,13 +24,13 @@ from dataset.data_io import (
     take,
 )
 
-NAME = "Ribosome_loading"
+NAME = "RibosomeLoading"
 SEQ_KEY = "utr"
 LABEL_KEY = "rl"
 SEQ_LEN = 50
 # Fraction of the provider train file held out as validation.
 VAL_RATIO = 0.15
-_DIR = "Ribosome_loading/MRL_Random50Nuc_SynthesisLibrary_Sample"
+_DIR = "RibosomeLoading/MRL_Random50Nuc_SynthesisLibrary_Sample"
 RELATIVE_TRAIN_CSV = f"{_DIR}/4.10_train_data_GSM3130438_egfp_pseudo_2.csv"
 RELATIVE_TEST_CSV = f"{_DIR}/4.10_test_data_GSM3130438_egfp_pseudo_2.csv"
 

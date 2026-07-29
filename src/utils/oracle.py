@@ -136,7 +136,7 @@ if __name__ == "__main__":
     # if missing, fall back to official pretrained weights.
     checks = [
         ("UTRLM_TE", "Zebrafish"),
-        ("UTRLM_MRL", "Ribosome_loading"),
+        ("UTRLM_MRL", "RibosomeLoading"),
         ("UTRLM", "OpenVaccine"),
     ]
     for oracle_name, dataset in checks:

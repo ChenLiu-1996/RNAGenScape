@@ -36,7 +36,7 @@ def make_dataloaders(
     """Build train/val/test loaders for a registered dataset.
 
     Args:
-        dataset: One of ``OpenVaccine``, ``Zebrafish``, ``Ribosome_loading``.
+        dataset: One of ``OpenVaccine``, ``Zebrafish``, ``RibosomeLoading``.
         representation: ``string`` | ``token_ids`` | ``one_hot``.
         label_norm: ``none`` | ``normal`` | ``minmax``.
         kwargs: Forwarded to the dataset module (e.g. test_ratio, val_ratio).
