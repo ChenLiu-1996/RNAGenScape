@@ -1,9 +1,9 @@
 """Train the Organized Autoencoder (OAE).
 
 Example:
-  python src/train_oae.py --dataset OpenVaccine --lr 1e-2 --recon_w 1.0
+  python src/train_oae.py --dataset OpenVaccine --lr 1e-2 --recon_w 1.0 --seed 1
 
-Saves ``results/<dataset>/OAE/model.pt`` (and ``label_stats.json``, ``train.log``).
+Saves ``results/<dataset>/OAE/seed_{seed}/model.pt`` (and ``label_stats.json``, ``train.log``).
 
 Loss: ``MSE + recon_w * CE`` (regression weight fixed at 1; tune via ``lr``).
 """
@@ -283,7 +283,7 @@ def main() -> None:
         f"warmup_epochs={warmup_epochs} start={args.lr * 0.01:.2e} end={args.lr * 0.1:.2e}"
     )
 
-    ckpt_path = oae_checkpoint_path(args.dataset)
+    ckpt_path = oae_checkpoint_path(args.dataset, args.seed)
     out_dir = os.path.dirname(ckpt_path)
     os.makedirs(out_dir, exist_ok=True)
     log_path = os.path.join(out_dir, "train.log")

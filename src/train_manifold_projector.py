@@ -1,17 +1,17 @@
 """Build / train a manifold projector (DAE or kNN support artifacts).
 
 Example:
-  python src/train_manifold_projector.py --dataset OpenVaccine --projector dae
-  python src/train_manifold_projector.py --dataset OpenVaccine --projector knn
+  python src/train_manifold_projector.py --dataset OpenVaccine --projector dae --seed 1
+  python src/train_manifold_projector.py --dataset OpenVaccine --projector knn --seed 1
 
 * ``dae``: train ``ManifoldProjectorDAE`` on OAE train latents; save
-  ``results/<dataset>/OAE/manifold_projector_dae_sugar{w}/model_latentnorm_{norm}.pt``
+  ``results/<dataset>/OAE/seed_{seed}/manifold_projector_dae_sugar{w}/model_latentnorm_{norm}.pt``
 * ``knn``: **not trainable**. Only encodes the training set with the OAE and
   caches those latents as
-  ``.../manifold_projector_knn_sugar{w}/latent_trainset.pt``. Choose ``k`` later
+  ``.../seed_{seed}/manifold_projector_knn_sugar{w}/latent_trainset.pt``. Choose ``k`` later
   at inference when constructing ``ManifoldProjectorKNN``.
 
-Requires a trained OAE at ``results/<dataset>/OAE/model.pt``.
+Requires a trained OAE at ``results/<dataset>/OAE/seed_{seed}/model.pt``.
 SUGAR augmentation (``sugar_w > 0``) is reserved for a later port.
 """
 
@@ -51,11 +51,11 @@ DEFAULT_HIDDEN_DIMS = (32, 16, 32)
 DEFAULT_NOISE_LEVELS = (0.5, 0.2, 0.1)
 
 
-def load_oae(dataset: str, device: str) -> OAE:
-    ckpt = oae_checkpoint_path(dataset)
+def load_oae(dataset: str, seed: int, device: str) -> OAE:
+    ckpt = oae_checkpoint_path(dataset, seed)
     if not os.path.isfile(ckpt):
         raise FileNotFoundError(
-            f"Missing OAE checkpoint: {ckpt}. Train with src/train_oae.py first."
+            f"Missing OAE checkpoint: {ckpt}. Train with src/train_oae.py --seed {seed} first."
         )
     seq_len = int(DATASET_CONFIG[dataset]["seq_len"])
     model = OAE(device=device, seq_len=seq_len, vocab_size=VOCAB_SIZE, latent_dim=320)
@@ -137,7 +137,7 @@ def main() -> None:
             "SUGAR augmentation is not ported yet. Use --sugar_w 0.0 for now."
         )
 
-    oae = load_oae(args.dataset, device)
+    oae = load_oae(args.dataset, args.seed, device)
     train_loader, _val_loader, _test_loader, info = make_dataloaders(
         args.dataset,
         batch_size=args.batch_size,
@@ -147,7 +147,7 @@ def main() -> None:
         num_workers=args.num_workers,
     )
     print(
-        f"dataset={args.dataset} projector={args.projector} "
+        f"dataset={args.dataset} projector={args.projector} seed={args.seed} "
         f"n_train={info.n_train} sugar_w={args.sugar_w} "
         f"latent_normalization={args.latent_normalization}"
     )
@@ -190,6 +190,7 @@ def main() -> None:
         )
         ckpt = manifold_projector_dae_checkpoint_path(
             args.dataset,
+            args.seed,
             sugar_w=args.sugar_w,
             latent_normalization=args.latent_normalization,
         )
@@ -220,7 +221,7 @@ def main() -> None:
 
     else:
         # Cache train latents only; k is chosen later at inference.
-        path = latent_trainset_path(args.dataset, sugar_w=args.sugar_w)
+        path = latent_trainset_path(args.dataset, args.seed, sugar_w=args.sugar_w)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(
             {

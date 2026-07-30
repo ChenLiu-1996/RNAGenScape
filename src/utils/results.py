@@ -46,9 +46,14 @@ def experiment_dir(
     return os.path.join(results_root(root), dataset, model, experiment)
 
 
-def oae_checkpoint_path(dataset: str, root: Optional[str] = None) -> str:
-    """Path to trained OAE weights: ``results/<dataset>/OAE/model.pt``."""
-    return os.path.join(results_root(root), dataset, "OAE", "model.pt")
+def oae_seed_dir(dataset: str, seed: int, root: Optional[str] = None) -> str:
+    """``results/<dataset>/OAE/seed_{seed}/`` (trained OAE + projector for that seed)."""
+    return os.path.join(results_root(root), dataset, "OAE", f"seed_{int(seed)}")
+
+
+def oae_checkpoint_path(dataset: str, seed: int, root: Optional[str] = None) -> str:
+    """Path to trained OAE weights: ``results/<dataset>/OAE/seed_{seed}/model.pt``."""
+    return os.path.join(oae_seed_dir(dataset, seed, root=root), "model.pt")
 
 
 def _sugar_tag(sugar_w: float) -> str:
@@ -65,51 +70,55 @@ def normalize_latent_norm_name(latent_normalization: str) -> str:
 
 
 def manifold_projector_dae_dir(
-    dataset: str, sugar_w: float = 0.0, root: Optional[str] = None
+    dataset: str,
+    seed: int,
+    sugar_w: float = 0.0,
+    root: Optional[str] = None,
 ) -> str:
-    """``results/<dataset>/OAE/manifold_projector_dae_sugar{w}/``."""
+    """``results/<dataset>/OAE/seed_{seed}/manifold_projector_dae_sugar{w}/``."""
     return os.path.join(
-        results_root(root),
-        dataset,
-        "OAE",
+        oae_seed_dir(dataset, seed, root=root),
         f"manifold_projector_dae_sugar{_sugar_tag(sugar_w)}",
     )
 
 
 def manifold_projector_dae_checkpoint_path(
     dataset: str,
+    seed: int,
     sugar_w: float = 0.0,
     latent_normalization: str = "none",
     root: Optional[str] = None,
 ) -> str:
-    """``.../manifold_projector_dae_sugar{w}/model_latentnorm_{norm}.pt``."""
+    """``.../seed_{seed}/manifold_projector_dae_sugar{w}/model_latentnorm_{norm}.pt``."""
     norm = normalize_latent_norm_name(latent_normalization)
     return os.path.join(
-        manifold_projector_dae_dir(dataset, sugar_w=sugar_w, root=root),
+        manifold_projector_dae_dir(dataset, seed, sugar_w=sugar_w, root=root),
         f"model_latentnorm_{norm}.pt",
     )
 
 
 def manifold_projector_knn_dir(
-    dataset: str, sugar_w: float = 0.0, root: Optional[str] = None
+    dataset: str,
+    seed: int,
+    sugar_w: float = 0.0,
+    root: Optional[str] = None,
 ) -> str:
-    """``results/<dataset>/OAE/manifold_projector_knn_sugar{w}/``."""
+    """``results/<dataset>/OAE/seed_{seed}/manifold_projector_knn_sugar{w}/``."""
     return os.path.join(
-        results_root(root),
-        dataset,
-        "OAE",
+        oae_seed_dir(dataset, seed, root=root),
         f"manifold_projector_knn_sugar{_sugar_tag(sugar_w)}",
     )
 
 
 def latent_trainset_path(
     dataset: str,
+    seed: int,
     sugar_w: float = 0.0,
     root: Optional[str] = None,
 ) -> str:
-    """``.../manifold_projector_knn_sugar{w}/latent_trainset.pt`` (k-agnostic)."""
+    """``.../seed_{seed}/manifold_projector_knn_sugar{w}/latent_trainset.pt`` (k-agnostic)."""
     return os.path.join(
-        manifold_projector_knn_dir(dataset, sugar_w=sugar_w, root=root),
+        manifold_projector_knn_dir(dataset, seed, sugar_w=sugar_w, root=root),
         "latent_trainset.pt",
     )
 
