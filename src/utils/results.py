@@ -46,6 +46,74 @@ def experiment_dir(
     return os.path.join(results_root(root), dataset, model, experiment)
 
 
+def oae_checkpoint_path(dataset: str, root: Optional[str] = None) -> str:
+    """Path to trained OAE weights: ``results/<dataset>/OAE/model.pt``."""
+    return os.path.join(results_root(root), dataset, "OAE", "model.pt")
+
+
+def _sugar_tag(sugar_w: float) -> str:
+    """Encode sugar weight for path segments (``1.0`` -> ``1p0``)."""
+    return str(float(sugar_w)).replace(".", "p")
+
+
+def normalize_latent_norm_name(latent_normalization: str) -> str:
+    """Canonical lowercase name for DAE checkpoint filenames."""
+    name = str(latent_normalization).strip().lower()
+    if name in ("", "none", "null"):
+        return "none"
+    return name
+
+
+def manifold_projector_dae_dir(
+    dataset: str, sugar_w: float = 0.0, root: Optional[str] = None
+) -> str:
+    """``results/<dataset>/OAE/manifold_projector_dae_sugar{w}/``."""
+    return os.path.join(
+        results_root(root),
+        dataset,
+        "OAE",
+        f"manifold_projector_dae_sugar{_sugar_tag(sugar_w)}",
+    )
+
+
+def manifold_projector_dae_checkpoint_path(
+    dataset: str,
+    sugar_w: float = 0.0,
+    latent_normalization: str = "none",
+    root: Optional[str] = None,
+) -> str:
+    """``.../manifold_projector_dae_sugar{w}/model_latentnorm_{norm}.pt``."""
+    norm = normalize_latent_norm_name(latent_normalization)
+    return os.path.join(
+        manifold_projector_dae_dir(dataset, sugar_w=sugar_w, root=root),
+        f"model_latentnorm_{norm}.pt",
+    )
+
+
+def manifold_projector_knn_dir(
+    dataset: str, sugar_w: float = 0.0, root: Optional[str] = None
+) -> str:
+    """``results/<dataset>/OAE/manifold_projector_knn_sugar{w}/``."""
+    return os.path.join(
+        results_root(root),
+        dataset,
+        "OAE",
+        f"manifold_projector_knn_sugar{_sugar_tag(sugar_w)}",
+    )
+
+
+def latent_trainset_path(
+    dataset: str,
+    sugar_w: float = 0.0,
+    root: Optional[str] = None,
+) -> str:
+    """``.../manifold_projector_knn_sugar{w}/latent_trainset.pt`` (k-agnostic)."""
+    return os.path.join(
+        manifold_projector_knn_dir(dataset, sugar_w=sugar_w, root=root),
+        "latent_trainset.pt",
+    )
+
+
 def evaluation_dir(exp_dir: str) -> str:
     path = os.path.join(exp_dir, "evaluation")
     os.makedirs(path, exist_ok=True)
@@ -112,7 +180,7 @@ def save_generation_artifact(
     model_type: str,
     data: str,
     seed: int,
-    subsample_seed: int = 2024,
+    subsample_seed: int = 42,
     trajectories=None,
     trajectories_are_sequences: bool = False,
     sugar_w: float = 0.0,
@@ -237,7 +305,7 @@ def summarize_per_seed_csv(
     summary_csv: str,
     skip_cols: Optional[Iterable[str]] = None,
 ) -> pd.DataFrame:
-    """Aggregate numeric columns as mean +/- std; write summary CSV and return it."""
+    """Aggregate numeric columns as mean +/- std across seeds; write summary CSV and return it."""
     df = pd.read_csv(per_seed_csv)
     skip = set(skip_cols or ()) | {"seed"}
     rows = []
@@ -262,15 +330,16 @@ def summarize_per_seed_csv(
 
 
 def format_summary_table(summary: pd.DataFrame) -> str:
-    """ASCII table: metric | mean +/- std."""
+    """ASCII table: metric | mean \u00B1 std (std across random seeds)."""
     if summary.empty:
         return "(no numeric metrics)"
-    lines = ["metric                         mean +/- std", "-" * 48]
+    pm = "\u00B1"
+    lines = [f"metric                         mean {pm} std", "-" * 48]
     for _, row in summary.iterrows():
         name = str(row["metric"])
         mean = float(row["mean"])
         std = float(row["std"])
-        lines.append(f"{name:<30} {mean:.6g} +/- {std:.6g}")
+        lines.append(f"{name:<30} {mean:.6g} {pm} {std:.6g}")
     n = int(summary["n_seeds"].iloc[0]) if "n_seeds" in summary.columns else 0
     lines.append("-" * 48)
     lines.append(f"n_seeds                        {n}")

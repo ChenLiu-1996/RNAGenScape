@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 # torch-scatter is built from source on this cluster (PyG wheels need newer glibc).
-# Build only (do NOT leave GCC/12 loaded when running Python — it breaks torch_scatter/ABI):
+# Build only (do NOT leave GCC/12 loaded when running Python - it breaks torch_scatter/ABI):
 #   module load GCC/12.2.0 CUDA/12.2.2
 #   UV_HTTP_TIMEOUT=600 CXX=$(which g++) CC=$(which gcc) uv sync --python 3.12
 #   module unload GCC

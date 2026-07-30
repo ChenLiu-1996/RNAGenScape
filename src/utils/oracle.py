@@ -19,11 +19,11 @@ from dataset.data_io import data_path, read_sequences_and_labels
 from utils.metrics import VOCAB_SIZE, decode_token_ids, to_token_ids
 from utils.results import results_root
 
-# Frozen zero-shot validators only — never enter train_oracle.py.
+# Frozen zero-shot oracles only - never enter train_oracle.py.
 FROZEN_HF_ORACLES = frozenset({"UTRLM_TE", "UTRLM_MRL"})
 # Architectures trained by train_oracle.py (pretrained UTRLM, Conv1d, ...).
 # TE/MRL must never appear here.
-TRAINABLE_ORACLES = frozenset({"UTRLM"})  # Conv1d added when implemented
+TRAINABLE_ORACLES = frozenset({"UTRLM", "Conv1d"})
 SUPPORTED_ORACLES = FROZEN_HF_ORACLES | TRAINABLE_ORACLES
 
 
@@ -67,11 +67,19 @@ def load_oracle(oracle: str, dataset: str):
         if not os.path.isfile(ckpt):
             raise FileNotFoundError(ckpt)
 
-    # Local import so metrics-only use does not require multimolecule.
-    from models.utrlm import UTRLM, UTRLM_MRL, UTRLM_TE
+    # Local imports so metrics-only use does not require multimolecule / torch models.
+    if oracle == "Conv1d":
+        from modules.conv1d import Conv1d
 
-    cls = {"UTRLM": UTRLM, "UTRLM_TE": UTRLM_TE, "UTRLM_MRL": UTRLM_MRL}[oracle]
-    model = cls(device=device, seq_len=seq_len, vocab_size=VOCAB_SIZE, latent_dim=128)
+        model = Conv1d(
+            device=device, seq_len=seq_len, vocab_size=VOCAB_SIZE, latent_dim=64
+        )
+    else:
+        from modules.utrlm import UTRLM, UTRLM_MRL, UTRLM_TE
+
+        cls = {"UTRLM": UTRLM, "UTRLM_TE": UTRLM_TE, "UTRLM_MRL": UTRLM_MRL}[oracle]
+        model = cls(device=device, seq_len=seq_len, vocab_size=VOCAB_SIZE, latent_dim=128)
+
     model = model.to(device)
     model.eval()
 
@@ -132,12 +140,13 @@ if __name__ == "__main__":
     device = resolve_device()
     print(f"device={device}")
 
-    # Frozen TE/MRL: zero-shot check. Trainable UTRLM needs results/.../model.pt;
-    # if missing, fall back to official pretrained weights.
+    # Frozen TE/MRL: zero-shot check. Trainable oracles need results/.../model.pt;
+    # UTRLM falls back to official pretrained; Conv1d falls back to random init.
     checks = [
         ("UTRLM_TE", "Zebrafish"),
         ("UTRLM_MRL", "RibosomeLoading"),
         ("UTRLM", "OpenVaccine"),
+        ("Conv1d", "OpenVaccine"),
     ]
     for oracle_name, dataset in checks:
         seq_len = int(DATASET_CONFIG[dataset]["seq_len"])
@@ -146,22 +155,32 @@ if __name__ == "__main__":
         try:
             model = load_oracle(oracle_name, dataset)
         except FileNotFoundError as exc:
-            if oracle_name != "UTRLM":
+            if oracle_name == "UTRLM":
+                from modules.utrlm import UTRLM, default_pretrained_pkl
+
+                pretrained = default_pretrained_pkl()
+                print(f"missing fine-tuned checkpoint: {exc}")
+                print(f"loading official pretrained from: {pretrained}")
+                model = UTRLM(
+                    device=device,
+                    seq_len=seq_len,
+                    vocab_size=VOCAB_SIZE,
+                    latent_dim=128,
+                    pretrained_path=pretrained,
+                )
+                model.eval()
+            elif oracle_name == "Conv1d":
+                from modules.conv1d import Conv1d
+
+                print(f"missing fine-tuned checkpoint: {exc}")
+                print("loading randomly initialized Conv1d for API check")
+                model = Conv1d(
+                    device=device, seq_len=seq_len, vocab_size=VOCAB_SIZE, latent_dim=64
+                )
+                model.eval()
+            else:
                 print(f"SKIP (missing checkpoint): {exc}")
                 continue
-            from models.utrlm import UTRLM, default_pretrained_pkl
-
-            pretrained = default_pretrained_pkl()
-            print(f"missing fine-tuned checkpoint: {exc}")
-            print(f"loading official pretrained from: {pretrained}")
-            model = UTRLM(
-                device=device,
-                seq_len=seq_len,
-                vocab_size=VOCAB_SIZE,
-                latent_dim=128,
-                pretrained_path=pretrained,
-            )
-            model.eval()
         scores, embeds = score_sequences(
             model,
             dummy,

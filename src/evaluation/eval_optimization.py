@@ -170,7 +170,7 @@ def main():
     summary = summarize_per_seed_csv(
         per_seed_path,
         summary_path,
-        skip_cols={"run_dir", "dataset", "oracle"},
+        skip_cols={"run_dir", "dataset", "oracle", "direction"},
     )
     table = format_summary_table(summary)
     print()

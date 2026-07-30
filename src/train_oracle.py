@@ -2,9 +2,11 @@
 
 Example:
   python src/train_oracle.py --dataset OpenVaccine --oracle UTRLM
+  python src/train_oracle.py --dataset OpenVaccine --oracle Conv1d
 
 Saves ``results/<dataset>/<oracle>/model.pt`` (and ``label_stats.json``).
 Only trainable architectures are allowed (never UTRLM_TE / UTRLM_MRL).
+Default trainable oracle in bash scripts remains ``UTRLM``.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from utils.training_utils import EarlyStopping, LinearWarmupCosineAnnealingLR, s
 # Batch representation expected by each trainable oracle.
 ORACLE_REPRESENTATION: Dict[str, str] = {
     "UTRLM": "string",
+    "Conv1d": "one_hot",
 }
 
 
@@ -44,7 +47,7 @@ def build_oracle(
     freeze_backbone: bool = False,
 ):
     if oracle == "UTRLM":
-        from models.utrlm import UTRLM
+        from modules.utrlm import UTRLM
 
         return UTRLM(
             device=device,
@@ -52,6 +55,16 @@ def build_oracle(
             vocab_size=VOCAB_SIZE,
             latent_dim=128,
             freeze_backbone=freeze_backbone,
+        )
+    if oracle == "Conv1d":
+        from modules.conv1d import Conv1d
+
+        # freeze_backbone is a no-op for Conv1d (no pretrained backbone).
+        return Conv1d(
+            device=device,
+            seq_len=seq_len,
+            vocab_size=VOCAB_SIZE,
+            latent_dim=64,
         )
     raise ValueError(
         f"Unsupported trainable oracle '{oracle}'. "
@@ -78,7 +91,7 @@ def evaluate(
 ) -> Tuple[float, float, float]:
     """Return mean MSE, Pearson r, Spearman r on a loader."""
     model.eval()
-    ys: List[float] = []
+    y_true: List[float] = []
     preds: List[float] = []
     total_loss = 0.0
     n_batches = 0
@@ -87,13 +100,13 @@ def evaluate(
         y_pred = model(x)
         total_loss += model.regression_loss(y_pred, y).item()
         n_batches += 1
-        ys.extend(y.detach().cpu().numpy().reshape(-1).tolist())
+        y_true.extend(y.detach().cpu().numpy().reshape(-1).tolist())
         preds.extend(y_pred.detach().cpu().numpy().reshape(-1).tolist())
     mse = total_loss / max(n_batches, 1)
-    if len(ys) < 2:
+    if len(y_true) < 2:
         return mse, float("nan"), float("nan")
-    pearson = float(pearsonr(ys, preds)[0])
-    spearman = float(spearmanr(ys, preds).correlation)
+    pearson = float(pearsonr(y_true, preds)[0])
+    spearman = float(spearmanr(y_true, preds).correlation)
     return mse, pearson, spearman
 
 
@@ -128,7 +141,7 @@ def train(
     try:
         for epoch in tqdm(range(1, max_epochs + 1), desc="epochs"):
             model.train()
-            train_ys: List[float] = []
+            train_y_true: List[float] = []
             train_preds: List[float] = []
             train_loss = 0.0
             n_batches = 0
@@ -143,7 +156,7 @@ def train(
 
                 train_loss += loss.item()
                 n_batches += 1
-                train_ys.extend(y.detach().cpu().numpy().reshape(-1).tolist())
+                train_y_true.extend(y.detach().cpu().numpy().reshape(-1).tolist())
                 train_preds.extend(y_pred.detach().cpu().numpy().reshape(-1).tolist())
 
             if lr_scheduler is not None:
@@ -151,9 +164,9 @@ def train(
             lr = optimizer.param_groups[0]["lr"]
 
             train_mse = train_loss / max(n_batches, 1)
-            train_pearson = float(pearsonr(train_ys, train_preds)[0]) if len(train_ys) > 1 else float("nan")
+            train_pearson = float(pearsonr(train_y_true, train_preds)[0]) if len(train_y_true) > 1 else float("nan")
             train_spearman = (
-                float(spearmanr(train_ys, train_preds).correlation) if len(train_ys) > 1 else float("nan")
+                float(spearmanr(train_y_true, train_preds).correlation) if len(train_y_true) > 1 else float("nan")
             )
             val_mse, val_pearson, val_spearman = evaluate(
                 model, val_loader, device=device, representation=representation
@@ -165,8 +178,8 @@ def train(
             )
             print(
                 f"epoch {epoch}/{max_epochs}  lr={lr:.2e}  "
-                f"train mse={train_mse:.4f} P={train_pearson:.4f} S={train_spearman:.4f}  "
-                f"val mse={val_mse:.4f} P={val_pearson:.4f} S={val_spearman:.4f}"
+                f"train mse={train_mse:.4f} pearson={train_pearson:.4f} spearman={train_spearman:.4f}  "
+                f"val mse={val_mse:.4f} pearson={val_pearson:.4f} spearman={val_spearman:.4f}"
             )
             log_f.write(line + "\n")
             log_f.flush()
@@ -197,7 +210,7 @@ def parse_args():
     p.add_argument("--oracle", type=str, required=True, choices=sorted(TRAINABLE_ORACLES))
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--max_epochs", type=int, default=200)
+    p.add_argument("--max_epochs", type=int, default=100)
     p.add_argument("--patience", type=int, default=20, help="Early stop patience on val Spearman.")
     p.add_argument("--label_norm", type=str, default="normal", choices=["none", "normal", "minmax"])
     p.add_argument("--seed", type=int, default=1)
@@ -215,7 +228,7 @@ def main() -> None:
     if args.oracle not in TRAINABLE_ORACLES:
         raise ValueError(
             f"Oracle '{args.oracle}' is not trainable. "
-            f"Frozen validators (UTRLM_TE / UTRLM_MRL) never enter train_oracle.py."
+            f"Frozen oracles (UTRLM_TE / UTRLM_MRL) never enter train_oracle.py."
         )
     representation = ORACLE_REPRESENTATION[args.oracle]
     seq_len = int(DATASET_CONFIG[args.dataset]["seq_len"])

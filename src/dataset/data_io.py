@@ -18,7 +18,7 @@ from utils.results import repo_root
 
 DEFAULT_SEED = 1
 
-# 8:1:1 train/val/test — val_ratio is of the post-test remainder (0.1 / 0.9).
+# 8:1:1 train/val/test - val_ratio is of the post-test remainder (0.1 / 0.9).
 SPLIT_8_1_1_TEST_RATIO = 0.1
 SPLIT_8_1_1_VAL_RATIO = 0.1 / 0.9
 

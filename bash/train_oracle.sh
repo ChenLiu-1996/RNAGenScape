@@ -9,7 +9,7 @@
 #SBATCH --mail-type=ALL
 #SBATCH --output=train_oracle-%j.out
 
-# Torch in .venv ships its own CUDA/cuDNN — do not module-load system CUDA.
+# Torch in .venv ships its own CUDA/cuDNN - do not module-load system CUDA.
 module purge
 module load miniconda
 
@@ -28,7 +28,7 @@ for data in "${DATASETS[@]}"; do
         --oracle "${ORACLE}" \
         --lr 1e-3 \
         --label_norm normal \
-        --max_epochs 200 \
+        --max_epochs 100 \
         --patience 20 \
         --batch_size 128 \
         --seed "${SEED}"

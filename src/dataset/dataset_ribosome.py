@@ -1,4 +1,4 @@
-"""Ribosome loading (MRL) dataset — Sample library, 4.10 split."""
+"""Ribosome loading (MRL) dataset - Sample library, 4.10 split."""
 
 from __future__ import annotations
 

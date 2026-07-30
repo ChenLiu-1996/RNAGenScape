@@ -143,7 +143,6 @@ def property_change_metrics(
 
     return {
         "mean_property_change": float(np.mean(delta)),
-        "std_property_change": float(np.std(delta)),
         "median_property_change": float(np.median(delta)),
         "pct_improved": float(100.0 * improved.sum() / n),
         "pct_worse": float(100.0 * worse.sum() / n),
@@ -196,14 +195,17 @@ def wasserstein_distance(seq_a, seq_b, metric: str = "hamming") -> float:
 
 
 def manifold_distance(generated, reference) -> Dict[str, float]:
-    """Mean / std / median Euclidean distance to nearest reference point."""
+    """Mean / median Euclidean distance to nearest reference point.
+
+    Within-run dispersion is not reported; seed-level mean +/- std is
+    computed later across random seeds.
+    """
     gen = np.asarray(generated, dtype=np.float64)
     ref = np.asarray(reference, dtype=np.float64)
     pairwise = sc_dist.cdist(gen, ref, metric="euclidean")
     closest = pairwise.min(axis=1)
     return {
         "manifold_distance_mean": float(np.mean(closest)),
-        "manifold_distance_std": float(np.std(closest)),
         "manifold_distance_median": float(np.median(closest)),
     }
 
@@ -253,19 +255,15 @@ def elite_distance_metrics(
     elite_mask = select_elite_mask(pool_scores, direction=direction, std_scale=std_scale)
     n_elite = int(elite_mask.sum())
     med = float(np.median(pool_scores))
-    spread = float(np.std(pool_scores))
     out: Dict[str, float] = {
         "elite_n": float(n_elite),
         "elite_pool_n": float(pool_scores.size),
         "elite_median": med,
-        "elite_std": spread,
         "elite_std_scale": float(std_scale),
     }
     if n_elite == 0:
         out["elite_nn_hamming_gen_mean"] = float("nan")
-        out["elite_nn_hamming_gen_std"] = float("nan")
         out["elite_nn_hamming_start_mean"] = float("nan")
-        out["elite_nn_hamming_start_std"] = float("nan")
         out["elite_w2_hamming"] = float("nan")
         return out
 
@@ -274,9 +272,7 @@ def elite_distance_metrics(
     gen_nn = nearest_hamming_distance(generated_tokens, elite_ids)
     start_nn = nearest_hamming_distance(start_tokens, elite_ids)
     out["elite_nn_hamming_gen_mean"] = float(np.mean(gen_nn))
-    out["elite_nn_hamming_gen_std"] = float(np.std(gen_nn))
     out["elite_nn_hamming_start_mean"] = float(np.mean(start_nn))
-    out["elite_nn_hamming_start_std"] = float(np.std(start_nn))
     out["elite_w2_hamming"] = float(
         wasserstein_distance(
             to_token_ids(generated_tokens).cpu().numpy(),
@@ -393,25 +389,20 @@ def mfe_scores(sequences) -> np.ndarray:
 
 
 def heuristic_summary(sequences, prefix: str) -> Dict[str, float]:
-    """Mean +/- reported as separate mean/std columns for CSV aggregation."""
+    """Per-run means only; seed-level mean +/- std is aggregated later."""
     uorf = uorf_aug_content(sequences)
     oof = uorf_oof_aug_content(sequences)
     gc = gc_content(sequences)
     kozak = kozak_similarity(sequences)
     out = {
         f"{prefix}_uorf_aug_mean": float(np.mean(uorf)),
-        f"{prefix}_uorf_aug_std": float(np.std(uorf)),
         f"{prefix}_uorf_oof_aug_mean": float(np.mean(oof)),
-        f"{prefix}_uorf_oof_aug_std": float(np.std(oof)),
         f"{prefix}_gc_mean": float(np.mean(gc)),
-        f"{prefix}_gc_std": float(np.std(gc)),
         f"{prefix}_kozak_mean": float(np.mean(kozak)),
-        f"{prefix}_kozak_std": float(np.std(kozak)),
     }
     if ViennaRNA is not None:
         mfe = mfe_scores(sequences)
         out[f"{prefix}_mfe_mean"] = float(np.mean(mfe))
-        out[f"{prefix}_mfe_std"] = float(np.std(mfe))
     return out
 
 

@@ -5,9 +5,9 @@ Trainable (via ``train_oracle.py`` only):
 * ``UTRLM`` - official pretrained UTR-LM backbone + per-dataset linear probe.
   Weights come from the a96123155/UTR-LM ``.pkl`` (SISS), remapped into a
   MultiMolecule ``UtrLmModel`` shell with the official 10-token alphabet.
-  Never uses TE/MRL hubs. Other trainable archs (e.g. Conv1d) live elsewhere.
+  Never uses TE/MRL hubs. Other trainable archs (e.g. ``Conv1d``) live elsewhere.
 
-Frozen zero-shot validators (never enter ``train_oracle.py``):
+Frozen zero-shot oracles (never enter ``train_oracle.py``):
 
 * ``UTRLM_TE`` / ``UTRLM_MRL`` - MultiMolecule TE/MRL finetunes, frozen only.
   Scoring: CLS -> sequence head (``mfe_head`` in the released weights).
@@ -32,7 +32,7 @@ from safetensors.torch import load_file
 
 # Official pretrained pickle (repo-relative). Must NOT be TE/MRL finetunes.
 UTRLM_PRETRAINED_RELPATH = "checkpoints/utrlm/utrlm_pretrained_siss_ep93.pkl"
-# Frozen zero-shot only — never used by train_oracle.py.
+# Frozen zero-shot only - never used by train_oracle.py.
 UTRLM_TE_PRETRAINED = "multimolecule/utrlm-te_el"
 UTRLM_MRL_PRETRAINED = "multimolecule/utrlm-mrl"
 UTRLM_ORACLE_NAMES = frozenset({"UTRLM", "UTRLM_TE", "UTRLM_MRL"})
