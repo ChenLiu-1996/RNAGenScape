@@ -19,15 +19,21 @@ source .venv/bin/activate
 
 DATASETS=(OpenVaccine Zebrafish RibosomeLoading)
 SEEDS=(1 2 3)
+# Ablation axes encoded in results path: d{LATENT_DIM}_recon{RECON_W}
+# kl_w is fixed (not path-ablated): mild β-VAE so recon/regression dominate.
 RECON_W=5.0
+KL_W=1e-4
+LATENT_DIM=128
 
 for data in "${DATASETS[@]}"; do
   for seed in "${SEEDS[@]}"; do
-    echo "========== Training OAE on ${data} (seed ${seed}, recon_w=${RECON_W}) =========="
+    echo "========== Training OAE on ${data} (seed ${seed}, D=${LATENT_DIM}, recon_w=${RECON_W}, kl_w=${KL_W}) =========="
     python src/train_oae.py \
       --dataset "${data}" \
       --lr 1e-3 \
       --recon_w "${RECON_W}" \
+      --kl_w "${KL_W}" \
+      --latent_dim "${LATENT_DIM}" \
       --label_norm normal \
       --max_epochs 100 \
       --patience 20 \
@@ -37,4 +43,4 @@ for data in "${DATASETS[@]}"; do
 done
 
 echo "Done. Checkpoints:"
-echo "  ${ROOT_DIR}/results/<dataset>/OAE/seed_*/model.pt"
+echo "  ${ROOT_DIR}/results/<dataset>/OAE/d${LATENT_DIM}_recon${RECON_W//./p}/seed_*/model.pt"

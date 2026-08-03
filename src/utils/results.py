@@ -27,6 +27,27 @@ _TRAIN_STATS_KEYS = (
 
 _SEED_DIR_RE = re.compile(r"^seed_(\d+)$")
 
+# Printed optimization table: core paper metrics first (Table 1 then Table 2),
+# then remaining metrics. ``None`` inserts a horizontal rule.
+# Each entry is (metric_key, display_label, value_scale).
+# value_scale=100 shows fraction metrics as percentages; "%" stays in the label.
+OPTIMIZATION_SUMMARY_CORE: Tuple[Optional[Tuple[str, str, float]], ...] = (
+    ("median_property_change", "Median property change", 1.0),
+    ("pct_improved", "Percentage improved, i.e., success rate (%)", 1.0),
+    None,
+    ("generated_uorf_oof_aug_mean", "uORF OOF AUG % (generated)", 100.0),
+    ("generated_kozak_mean", "Kozak Similarity % (generated)", 100.0),
+    ("generated_mfe_mean", "Minimum Free Energy (generated)", 1.0),
+    None,
+    ("root_uorf_oof_aug_mean", "uORF OOF AUG % (test data)", 100.0),
+    ("root_kozak_mean", "Kozak Similarity % (test data)", 100.0),
+    ("root_mfe_mean", "Minimum Free Energy (test data)", 1.0),
+    None,
+    ("elite_nn_hamming_gen_mean", "Elite NN edit distance (generated)", 1.0),
+    ("elite_nn_hamming_root_mean", "Elite NN edit distance (test data)", 1.0),
+    None,
+)
+
 
 def repo_root() -> str:
     """RNAGenScape repository root (parent of src/)."""
@@ -37,28 +58,109 @@ def results_root(root: Optional[str] = None) -> str:
     return os.path.join(root or repo_root(), "results")
 
 
+def _float_tag(value: float) -> str:
+    """Encode a float for path segments (``5.0`` -> ``5p0``, ``1e-4`` stays ``0p0001``)."""
+    return str(float(value)).replace(".", "p")
+
+
+def oae_config_tag(latent_dim: int, recon_w: float) -> str:
+    """Ablation folder for an OAE variant: ``d128_recon5p0``."""
+    return f"d{int(latent_dim)}_recon{_float_tag(recon_w)}"
+
+
+def oae_config_dir(
+    dataset: str,
+    latent_dim: int,
+    recon_w: float,
+    root: Optional[str] = None,
+) -> str:
+    """``results/<dataset>/OAE/d{latent}_recon{w}/``."""
+    return os.path.join(
+        results_root(root), dataset, "OAE", oae_config_tag(latent_dim, recon_w)
+    )
+
+
 def experiment_dir(
     dataset: str,
     model: str,
     experiment: str,
+    *,
+    oae_latent_dim: Optional[int] = None,
+    oae_recon_w: Optional[float] = None,
     root: Optional[str] = None,
 ) -> str:
+    """Experiment outputs dir.
+
+    For OAE, generation/eval live under the ablation config:
+    ``results/<dataset>/OAE/d{latent}_recon{w}/<experiment>/``.
+    """
+    if model == "OAE":
+        if oae_latent_dim is None or oae_recon_w is None:
+            raise ValueError(
+                "experiment_dir(..., model='OAE') requires oae_latent_dim and oae_recon_w"
+            )
+        return os.path.join(
+            oae_config_dir(dataset, oae_latent_dim, oae_recon_w, root=root),
+            experiment,
+        )
     return os.path.join(results_root(root), dataset, model, experiment)
 
 
-def oae_seed_dir(dataset: str, seed: int, root: Optional[str] = None) -> str:
-    """``results/<dataset>/OAE/seed_{seed}/`` (trained OAE + projector for that seed)."""
-    return os.path.join(results_root(root), dataset, "OAE", f"seed_{int(seed)}")
+def oae_seed_dir(
+    dataset: str,
+    seed: int,
+    *,
+    latent_dim: int,
+    recon_w: float,
+    root: Optional[str] = None,
+) -> str:
+    """``results/<dataset>/OAE/d{latent}_recon{w}/seed_{seed}/``."""
+    return os.path.join(
+        oae_config_dir(dataset, latent_dim, recon_w, root=root),
+        f"seed_{int(seed)}",
+    )
 
 
-def oae_checkpoint_path(dataset: str, seed: int, root: Optional[str] = None) -> str:
-    """Path to trained OAE weights: ``results/<dataset>/OAE/seed_{seed}/model.pt``."""
-    return os.path.join(oae_seed_dir(dataset, seed, root=root), "model.pt")
+def oae_checkpoint_path(
+    dataset: str,
+    seed: int,
+    *,
+    latent_dim: int,
+    recon_w: float,
+    root: Optional[str] = None,
+) -> str:
+    """``results/<dataset>/OAE/d{latent}_recon{w}/seed_{seed}/model.pt``."""
+    return os.path.join(
+        oae_seed_dir(
+            dataset, seed, latent_dim=latent_dim, recon_w=recon_w, root=root
+        ),
+        "model.pt",
+    )
+
+
+def baseline_seed_dir(
+    dataset: str,
+    model: str,
+    seed: int,
+    root: Optional[str] = None,
+) -> str:
+    """``results/<dataset>/<model>/seed_{seed}/`` for comparison baselines."""
+    return os.path.join(results_root(root), dataset, model, f"seed_{int(seed)}")
+
+
+def baseline_checkpoint_path(
+    dataset: str,
+    model: str,
+    seed: int,
+    root: Optional[str] = None,
+) -> str:
+    """``results/<dataset>/<model>/seed_{seed}/model.pt``."""
+    return os.path.join(baseline_seed_dir(dataset, model, seed, root=root), "model.pt")
 
 
 def _sugar_tag(sugar_w: float) -> str:
     """Encode sugar weight for path segments (``1.0`` -> ``1p0``)."""
-    return str(float(sugar_w)).replace(".", "p")
+    return _float_tag(sugar_w)
 
 
 def normalize_latent_norm_name(latent_normalization: str) -> str:
@@ -72,12 +174,17 @@ def normalize_latent_norm_name(latent_normalization: str) -> str:
 def manifold_projector_dae_dir(
     dataset: str,
     seed: int,
+    *,
+    latent_dim: int,
+    recon_w: float,
     sugar_w: float = 0.0,
     root: Optional[str] = None,
 ) -> str:
-    """``results/<dataset>/OAE/seed_{seed}/manifold_projector_dae_sugar{w}/``."""
+    """``.../OAE/d{latent}_recon{w}/seed_{seed}/manifold_projector_dae_sugar{w}/``."""
     return os.path.join(
-        oae_seed_dir(dataset, seed, root=root),
+        oae_seed_dir(
+            dataset, seed, latent_dim=latent_dim, recon_w=recon_w, root=root
+        ),
         f"manifold_projector_dae_sugar{_sugar_tag(sugar_w)}",
     )
 
@@ -85,6 +192,9 @@ def manifold_projector_dae_dir(
 def manifold_projector_dae_checkpoint_path(
     dataset: str,
     seed: int,
+    *,
+    latent_dim: int,
+    recon_w: float,
     sugar_w: float = 0.0,
     latent_normalization: str = "none",
     root: Optional[str] = None,
@@ -92,7 +202,14 @@ def manifold_projector_dae_checkpoint_path(
     """``.../seed_{seed}/manifold_projector_dae_sugar{w}/model_latentnorm_{norm}.pt``."""
     norm = normalize_latent_norm_name(latent_normalization)
     return os.path.join(
-        manifold_projector_dae_dir(dataset, seed, sugar_w=sugar_w, root=root),
+        manifold_projector_dae_dir(
+            dataset,
+            seed,
+            latent_dim=latent_dim,
+            recon_w=recon_w,
+            sugar_w=sugar_w,
+            root=root,
+        ),
         f"model_latentnorm_{norm}.pt",
     )
 
@@ -100,12 +217,17 @@ def manifold_projector_dae_checkpoint_path(
 def manifold_projector_knn_dir(
     dataset: str,
     seed: int,
+    *,
+    latent_dim: int,
+    recon_w: float,
     sugar_w: float = 0.0,
     root: Optional[str] = None,
 ) -> str:
-    """``results/<dataset>/OAE/seed_{seed}/manifold_projector_knn_sugar{w}/``."""
+    """``.../OAE/d{latent}_recon{w}/seed_{seed}/manifold_projector_knn_sugar{w}/``."""
     return os.path.join(
-        oae_seed_dir(dataset, seed, root=root),
+        oae_seed_dir(
+            dataset, seed, latent_dim=latent_dim, recon_w=recon_w, root=root
+        ),
         f"manifold_projector_knn_sugar{_sugar_tag(sugar_w)}",
     )
 
@@ -113,12 +235,22 @@ def manifold_projector_knn_dir(
 def latent_trainset_path(
     dataset: str,
     seed: int,
+    *,
+    latent_dim: int,
+    recon_w: float,
     sugar_w: float = 0.0,
     root: Optional[str] = None,
 ) -> str:
     """``.../seed_{seed}/manifold_projector_knn_sugar{w}/latent_trainset.pt`` (k-agnostic)."""
     return os.path.join(
-        manifold_projector_knn_dir(dataset, seed, sugar_w=sugar_w, root=root),
+        manifold_projector_knn_dir(
+            dataset,
+            seed,
+            latent_dim=latent_dim,
+            recon_w=recon_w,
+            sugar_w=sugar_w,
+            root=root,
+        ),
         "latent_trainset.pt",
     )
 
@@ -339,17 +471,43 @@ def summarize_per_seed_csv(
 
 
 def format_summary_table(summary: pd.DataFrame) -> str:
-    """ASCII table: metric | mean \u00B1 std (std across random seeds)."""
+    """ASCII table: metric | mean \u00B1 std (std across random seeds).
+
+    Core RNAGenScape paper metrics (Table 1 then Table 2) are listed first with
+    section breaks; remaining metrics follow. Fraction heuristics that should be
+    read as percentages are scaled for display; the "%" lives in the label only.
+    """
     if summary.empty:
         return "(no numeric metrics)"
+
+    by_metric = {str(row["metric"]): row for _, row in summary.iterrows()}
     pm = "\u00B1"
-    lines = [f"metric                         mean {pm} std", "-" * 48]
+    label_width = 48
+    rule = "-" * (label_width + 22)
+    lines = [f"{'metric':<{label_width}} mean {pm} std", rule]
+
+    def _append_row(label: str, mean: float, std: float) -> None:
+        lines.append(f"{label:<{label_width}} {mean:.6g} {pm} {std:.6g}")
+
+    shown: set = set()
+    for spec in OPTIMIZATION_SUMMARY_CORE:
+        if spec is None:
+            lines.append(rule)
+            continue
+        key, label, scale = spec
+        if key not in by_metric:
+            continue
+        row = by_metric[key]
+        _append_row(label, float(row["mean"]) * scale, float(row["std"]) * scale)
+        shown.add(key)
+
     for _, row in summary.iterrows():
-        name = str(row["metric"])
-        mean = float(row["mean"])
-        std = float(row["std"])
-        lines.append(f"{name:<30} {mean:.6g} {pm} {std:.6g}")
+        key = str(row["metric"])
+        if key in shown:
+            continue
+        _append_row(key, float(row["mean"]), float(row["std"]))
+
     n = int(summary["n_seeds"].iloc[0]) if "n_seeds" in summary.columns else 0
-    lines.append("-" * 48)
-    lines.append(f"n_seeds                        {n}")
+    lines.append(rule)
+    lines.append(f"{'n_seeds':<{label_width}} {n}")
     return "\n".join(lines)

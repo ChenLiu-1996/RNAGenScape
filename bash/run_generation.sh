@@ -20,6 +20,9 @@ source .venv/bin/activate
 DATASETS=(OpenVaccine Zebrafish RibosomeLoading)
 SEEDS=(1 2 3)
 DIRECTIONS=(1 -1)
+# Must match the trained OAE ablation folder: d{LATENT_DIM}_recon{RECON_W}
+LATENT_DIM=128
+RECON_W=5.0
 # projector configs: "dae" or "knn:<k>"
 PROJECTORS=(dae knn:1 knn:5 knn:10)
 SUGAR_W=0.0
@@ -46,13 +49,15 @@ for data in "${DATASETS[@]}"; do
       EXPERIMENT="${DIR_TAG}_samehyper_sugar0p0_${PROJ_TAG}"
 
       for seed in "${SEEDS[@]}"; do
-        echo "========== Generate ${data} ${EXPERIMENT} seed=${seed} =========="
+        echo "========== Generate ${data} ${EXPERIMENT} seed=${seed} D=${LATENT_DIM} recon_w=${RECON_W} =========="
         python src/run_generation.py \
           --dataset "${data}" \
           --method rnagenscape \
           --model OAE \
           --experiment "${EXPERIMENT}" \
           --seed "${seed}" \
+          --latent_dim "${LATENT_DIM}" \
+          --recon_w "${RECON_W}" \
           --subsample_seed "${SUBSAMPLE_SEED}" \
           --direction "${direction}" \
           --projector "${PROJECTOR}" \
@@ -72,6 +77,8 @@ for data in "${DATASETS[@]}"; do
         --dataset "${data}" \
         --model OAE \
         --experiment "${EXPERIMENT}" \
+        --latent_dim "${LATENT_DIM}" \
+        --recon_w "${RECON_W}" \
         --oracle "${ORACLE}" \
         --batch_size 128
     done
@@ -79,6 +86,6 @@ for data in "${DATASETS[@]}"; do
 done
 
 echo "Done."
-echo "  checkpoints: results/<dataset>/OAE/seed_*/model.pt (+ dae/knn projector)"
-echo "  generation:  results/<dataset>/OAE/<experiment>/seed_*/generation.npz"
-echo "  evaluation:  results/<dataset>/OAE/<experiment>/evaluation/"
+echo "  checkpoints: results/<dataset>/OAE/d${LATENT_DIM}_recon${RECON_W//./p}/seed_*/model.pt (+ dae/knn projector)"
+echo "  generation:  results/<dataset>/OAE/d${LATENT_DIM}_recon${RECON_W//./p}/<experiment>/seed_*/generation.npz"
+echo "  evaluation:  results/<dataset>/OAE/d${LATENT_DIM}_recon${RECON_W//./p}/<experiment>/evaluation/"

@@ -9,7 +9,8 @@ Example:
     --experiment pos_samehyper_sugar0p0 --seed 1 --direction 1 \\
     --projector dae --sugar_w 0.0 --num_steps 100 --step_size 5e-3 --temperature 1e-3
 
-``--seed`` selects the trained OAE / projector under ``results/<dataset>/OAE/seed_{seed}/``.
+``--seed`` selects the trained OAE / projector under
+``results/<dataset>/OAE/d{latent}_recon{w}/seed_{seed}/``.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from dataset import DATASET_CONFIG, DATASET_NAMES, make_dataloaders
 from modules.langevin import run_manifold_langevin
 from modules.manifold_projector_dae import load_manifold_projector_dae
 from modules.manifold_projector_knn import ManifoldProjectorKNN
-from modules.oae import OAE
+from modules.oae import OAE, load_oae
 from utils.metrics import VOCAB_SIZE, to_token_ids
 from utils.oracle import resolve_device
 from utils.results import (
@@ -50,21 +51,40 @@ METHODS = ("rnagenscape", "denovo", "guided", "simple_opt")
 DEFAULT_DAE_HIDDEN_DIMS = (32, 16, 32)
 
 
-def load_oae(dataset: str, seed: int, device: str) -> OAE:
-    ckpt = oae_checkpoint_path(dataset, seed)
+def load_oae_model(
+    dataset: str,
+    seed: int,
+    device: str,
+    *,
+    latent_dim: int,
+    recon_w: float,
+) -> OAE:
+    ckpt = oae_checkpoint_path(
+        dataset, seed, latent_dim=latent_dim, recon_w=recon_w
+    )
     if not os.path.isfile(ckpt):
         raise FileNotFoundError(
             f"Missing OAE checkpoint: {ckpt}. Train with src/train_oae.py --seed {seed} first."
         )
     seq_len = int(DATASET_CONFIG[dataset]["seq_len"])
-    model = OAE(device=device, seq_len=seq_len, vocab_size=VOCAB_SIZE, latent_dim=320)
-    model.load_state_dict(torch.load(ckpt, map_location=device))
-    model.eval()
-    return model
+    return load_oae(ckpt, device=device, seq_len=seq_len, vocab_size=VOCAB_SIZE)
 
 
-def load_label_stats(dataset: str, seed: int) -> Dict[str, float]:
-    path = os.path.join(os.path.dirname(oae_checkpoint_path(dataset, seed)), "label_stats.json")
+def load_label_stats(
+    dataset: str,
+    seed: int,
+    *,
+    latent_dim: int,
+    recon_w: float,
+) -> Dict[str, float]:
+    path = os.path.join(
+        os.path.dirname(
+            oae_checkpoint_path(
+                dataset, seed, latent_dim=latent_dim, recon_w=recon_w
+            )
+        ),
+        "label_stats.json",
+    )
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Missing label stats: {path}")
     with open(path, encoding="utf-8") as f:
@@ -125,6 +145,8 @@ def load_projector(
     latent_normalization: str,
     knn_k: int,
     latent_dim: int,
+    recon_w: float,
+    oae_latent_dim: int,
     device: str,
     hidden_dims: Tuple[int, ...] = DEFAULT_DAE_HIDDEN_DIMS,
 ):
@@ -132,6 +154,8 @@ def load_projector(
         path = manifold_projector_dae_checkpoint_path(
             dataset,
             seed,
+            latent_dim=oae_latent_dim,
+            recon_w=recon_w,
             sugar_w=sugar_w,
             latent_normalization=latent_normalization,
         )
@@ -144,7 +168,13 @@ def load_projector(
             path, input_dim=latent_dim, hidden_dims=hidden_dims, device=device
         )
     if projector == "knn":
-        path = latent_trainset_path(dataset, seed, sugar_w=sugar_w)
+        path = latent_trainset_path(
+            dataset,
+            seed,
+            latent_dim=oae_latent_dim,
+            recon_w=recon_w,
+            sugar_w=sugar_w,
+        )
         if not os.path.isfile(path):
             raise FileNotFoundError(
                 f"Missing kNN latent trainset: {path}. "
@@ -198,8 +228,19 @@ def run_rnagenscape(args, device: str) -> str:
     if args.model != "OAE":
         raise ValueError("method=rnagenscape currently requires --model OAE")
 
-    oae = load_oae(args.dataset, args.seed, device)
-    label_stats = load_label_stats(args.dataset, args.seed)
+    oae = load_oae_model(
+        args.dataset,
+        args.seed,
+        device,
+        latent_dim=args.latent_dim,
+        recon_w=args.recon_w,
+    )
+    label_stats = load_label_stats(
+        args.dataset,
+        args.seed,
+        latent_dim=args.latent_dim,
+        recon_w=args.recon_w,
+    )
 
     # Match the train/val/test split used when training this OAE / projector seed.
     train_loader, _val_loader, test_loader, info = make_dataloaders(
@@ -246,6 +287,8 @@ def run_rnagenscape(args, device: str) -> str:
         latent_normalization=args.latent_normalization,
         knn_k=args.knn_k,
         latent_dim=sampled_latent.shape[1],
+        recon_w=args.recon_w,
+        oae_latent_dim=args.latent_dim,
         device=device,
     )
 
@@ -285,7 +328,13 @@ def run_rnagenscape(args, device: str) -> str:
         seq_trajectories = torch.stack(steps, dim=0)
 
     out_dir = os.path.join(
-        experiment_dir(args.dataset, args.model, args.experiment),
+        experiment_dir(
+            args.dataset,
+            args.model,
+            args.experiment,
+            oae_latent_dim=args.latent_dim,
+            oae_recon_w=args.recon_w,
+        ),
         f"seed_{args.seed}",
     )
     os.makedirs(out_dir, exist_ok=True)
@@ -314,6 +363,8 @@ def run_rnagenscape(args, device: str) -> str:
             "use_fitness": bool(args.use_fitness),
             "use_projector": bool(args.use_projector),
             "latent_normalization": normalize_latent_norm_name(args.latent_normalization),
+            "oae_latent_dim": int(args.latent_dim),
+            "oae_recon_w": float(args.recon_w),
         },
     )
     print(f"wrote {path}")
@@ -346,16 +397,15 @@ def parse_args():
     p.add_argument("--method", type=str, required=True, choices=METHODS)
     p.add_argument("--model", type=str, required=True, help="Results folder name (e.g. OAE).")
     p.add_argument("--experiment", type=str, required=True, help="Experiment id (no seed).")
-    p.add_argument(
-        "--seed",
-        type=int,
-        default=1,
-        help="Training seed: loads OAE/projector from results/.../OAE/seed_{seed}/ and matches the data split.",
-    )
+    p.add_argument("--seed", type=int, default=1, help="Training seed; loads OAE/projector under d*_recon*/seed_{seed}/.")
     p.add_argument("--subsample_seed", type=int, default=42, help="RNG for start-pool subsample.")
     p.add_argument("--direction", type=float, default=1.0, help="+1 maximize / -1 minimize property.")
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--num_workers", type=int, default=0)
+
+    # OAE ablation folder (must match trained checkpoint)
+    p.add_argument("--latent_dim", type=int, default=128, help="OAE latent dim; path OAE/d{latent}_recon{w}/.")
+    p.add_argument("--recon_w", type=float, default=5.0, help="OAE recon weight; path OAE/d{latent}_recon{w}/.")
 
     # RNAGenScape / projector
     p.add_argument("--projector", type=str, default="dae", choices=["dae", "knn"])

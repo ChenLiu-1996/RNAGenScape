@@ -49,6 +49,8 @@ def parse_args():
     p.add_argument("--experiment", type=str, required=True, help="Experiment id (fixed settings, no seed)")
     p.add_argument("--oracle", type=str, required=True, choices=sorted(SUPPORTED_ORACLES))
     p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--latent_dim", type=int, default=128, help="For OAE: path tag d{latent}_recon{w}.")
+    p.add_argument("--recon_w", type=float, default=5.0, help="For OAE: path tag d{latent}_recon{w}.")
     return p.parse_args()
 
 
@@ -116,7 +118,10 @@ def evaluate_one_seed(
 def main():
     args = parse_args()
     device = resolve_device()
-    exp_dir = experiment_dir(args.dataset, args.model, args.experiment)
+    exp_kwargs = {}
+    if args.model == "OAE":
+        exp_kwargs = {"oae_latent_dim": args.latent_dim, "oae_recon_w": args.recon_w}
+    exp_dir = experiment_dir(args.dataset, args.model, args.experiment, **exp_kwargs)
     out_dir = evaluation_dir(exp_dir)
 
     print(f"Experiment: {exp_dir}")

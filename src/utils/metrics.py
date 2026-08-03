@@ -263,7 +263,7 @@ def elite_distance_metrics(
     }
     if n_elite == 0:
         out["elite_nn_hamming_gen_mean"] = float("nan")
-        out["elite_nn_hamming_start_mean"] = float("nan")
+        out["elite_nn_hamming_root_mean"] = float("nan")
         out["elite_w2_hamming"] = float("nan")
         return out
 
@@ -272,7 +272,7 @@ def elite_distance_metrics(
     gen_nn = nearest_hamming_distance(generated_tokens, elite_ids)
     start_nn = nearest_hamming_distance(start_tokens, elite_ids)
     out["elite_nn_hamming_gen_mean"] = float(np.mean(gen_nn))
-    out["elite_nn_hamming_start_mean"] = float(np.mean(start_nn))
+    out["elite_nn_hamming_root_mean"] = float(np.mean(start_nn))
     out["elite_w2_hamming"] = float(
         wasserstein_distance(
             to_token_ids(generated_tokens).cpu().numpy(),
@@ -485,5 +485,5 @@ def optimization_metrics(
     )
 
     metrics.update(heuristic_summary(gen_ids, prefix="generated"))
-    metrics.update(heuristic_summary(start_ids, prefix="start"))
+    metrics.update(heuristic_summary(start_ids, prefix="root"))
     return metrics
