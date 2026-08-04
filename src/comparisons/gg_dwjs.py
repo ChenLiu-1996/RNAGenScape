@@ -136,7 +136,6 @@ class gg_dWJS(nn.Module):
         targets: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         recon_weight: float = 1.0,
-        property_weight: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Joint denoiser + property loss on smoothed one-hots.
 
@@ -144,7 +143,7 @@ class gg_dWJS(nn.Module):
             x_0: token ids ``[B, L]``
             targets: property labels ``[B]`` or ``[B, P]``
             mask: bool pad mask True=valid ``[B, L]``
-            recon_weight / property_weight: loss weights
+            recon_weight: weight on generative loss
 
         Returns:
             total_loss, recon_loss, property_loss, property_pred ``[B, P]``
@@ -170,7 +169,7 @@ class gg_dWJS(nn.Module):
                 targets = targets.unsqueeze(-1)
             prop_loss = F.mse_loss(prop_pred, targets)
 
-        total = recon_weight * recon_loss + property_weight * prop_loss
+        total = recon_weight * recon_loss + prop_loss
         return total, recon_loss, prop_loss, prop_pred
 
     def _property_grad(

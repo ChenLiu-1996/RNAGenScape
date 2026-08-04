@@ -1,19 +1,22 @@
 """RNA-adapted Energy Matching (EM) baseline.
 
-Official Energy Matching ([m1balcerak/EnergyMatching](https://github.com/m1balcerak/EnergyMatching),
-NeurIPS 2025, arXiv:2504.10612) learns a *time-independent scalar potential*
-``V_theta(x)`` whose negative gradient ``-∇V`` transports noise to data
-(OT / flow matching), while contrastive divergence near the data shapes
-``V`` into an unnormalized log-likelihood (EBM). Protein inverse design in
-the official repo runs EM in a pretrained VAE latent with a separate
-fitness CNN for guided sampling.
+Official Energy Matching (m1balcerak/EnergyMatching, NeurIPS 2025, arXiv:2504.10612)
+learns a time-independent scalar potential V_theta(x) whose negative gradient
+-grad_x V transports noise to data (OT / flow matching), while contrastive
+divergence near the data shapes V into an unnormalized log-likelihood (EBM).
+Protein inverse design in the official repo runs EM in a pretrained VAE latent
+with a separate fitness CNN for guided sampling.
 
-This RNA baseline keeps the EM recipe on continuous nucleotide one-hots
-(PAD/A/G/C/T/U/N), with a small Transformer potential + joint property head
-(matching our other comparison trainers). Intentional simplifications vs the
-official code: no VAE / UNet1D / torchcfm / multi-GPU CD warm-up schedule;
-minibatch OT uses ``scipy.optimize.linear_sum_assignment``; CD is optional
-(``lambda_cd``, default 0 = flow-only warm-up).
+This RNA baseline keeps the EM training/sampling recipe on continuous nucleotide
+one-hots (PAD/A/G/C/T/U/N), with a small Transformer potential + joint property
+head (matching our other comparison trainers). Intentional RNA adaptations vs
+official proteins code: no VAE / UNet1D / torchcfm / multi-GPU CD warm-up;
+minibatch OT via scipy.optimize.linear_sum_assignment; CD optional
+(lambda_cd, default 0 = flow-only warm-up, matching official Algorithm 1).
+
+Velocity / CD / SDE updates follow experiments/proteins/model_proteins.py and
+utils_train_proteins.py (enable_grad + create_graph for -grad V; MALA gibbs;
+Euler-Maruyama with piecewise epsilon(t)).
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ from scipy.optimize import linear_sum_assignment
 
 @contextmanager
 def _math_sdp() -> Iterator[None]:
-    """Force math SDPA (needed for create_graph through Transformer attention)."""
+    """Force math-only SDPA (same intent as official sdp_kernel flash/mem off)."""
     cm = None
     try:
         from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -43,19 +46,17 @@ def _math_sdp() -> Iterator[None]:
         with cm:
             yield
         return
-    # Fallback for older PyTorch: flip CUDA SDP backend flags.
-    flash = torch.backends.cuda.flash_sdp_enabled()
-    mem = torch.backends.cuda.mem_efficient_sdp_enabled()
-    math_on = torch.backends.cuda.math_sdp_enabled()
-    torch.backends.cuda.enable_flash_sdp(False)
-    torch.backends.cuda.enable_mem_efficient_sdp(False)
-    torch.backends.cuda.enable_math_sdp(True)
     try:
-        yield
-    finally:
-        torch.backends.cuda.enable_flash_sdp(flash)
-        torch.backends.cuda.enable_mem_efficient_sdp(mem)
-        torch.backends.cuda.enable_math_sdp(math_on)
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=False,
+            enable_mem_efficient=False,
+            enable_math=True,
+        ):
+            yield
+        return
+    except Exception:
+        pass
+    yield
 
 
 class EM(nn.Module):
@@ -170,7 +171,8 @@ class EM(nn.Module):
     ) -> torch.Tensor:
         """Time-independent scalar potential ``V(x)`` with shape ``[B]``.
 
-        ``t`` is unused (static field); kept so callers can pass a time tensor.
+        ``t`` is unused (static field); kept so callers can pass a time tensor
+        (same convention as official Unet1DModelWrapper.potential).
         """
         del t  # time-independent field
         h = self._encode(x, pad_mask=pad_mask)
@@ -183,18 +185,18 @@ class EM(nn.Module):
         t: Optional[torch.Tensor] = None,
         pad_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """``-∇_x V(x)`` with the same shape as ``x``."""
-        x_req = x if x.requires_grad else x.detach().requires_grad_(True)
-        # Fused SDPA backward has no higher-order grads; math SDPA does.
-        with _math_sdp():
-            v = self.potential(x_req, t=t, pad_mask=pad_mask)
-            grad = torch.autograd.grad(
-                outputs=v.sum(),
-                inputs=x_req,
-                create_graph=True,
-                retain_graph=True,
-            )[0]
-        return -grad
+        """``-grad_x V(x)``, matching official Unet1DModelWrapper.velocity."""
+        with torch.enable_grad():
+            x = x.clone().detach().requires_grad_(True)
+            with _math_sdp():
+                v = self.potential(x, t, pad_mask=pad_mask)
+                d_v_dx = torch.autograd.grad(
+                    outputs=v,
+                    inputs=x,
+                    grad_outputs=torch.ones_like(v),
+                    create_graph=True,
+                )[0]
+            return -d_v_dx
 
     def predict_property(
         self,
@@ -234,21 +236,21 @@ class EM(nn.Module):
 
     @staticmethod
     def _flow_weight(t: torch.Tensor, cutoff: float) -> torch.Tensor:
-        """Gate flow loss: 1 for t < cutoff, linear decay to 0 at t=1."""
+        """Official flow_weight: 1 for t < cutoff, linear decay to 0 at t=1."""
         w = torch.ones_like(t)
         decay = (t >= cutoff) & (t < 1.0)
-        w[decay] = 1.0 - (t[decay] - cutoff) / max(1.0 - cutoff, 1e-8)
+        w[decay] = 1.0 - (t[decay] - cutoff) / (1.0 - cutoff)
         w[t >= 1.0] = 0.0
         return w
 
     def _epsilon(self, t_val: float) -> float:
-        """Piecewise temperature schedule used in EM sampling / CD."""
+        """Piecewise epsilon(t) for sampling / CD (official plot_epsilon / sde_epsilon)."""
         cutoff = self.time_cutoff
         eps_max = self.epsilon_max
         if t_val < cutoff:
             return 0.0
         if t_val < 1.0:
-            return ((t_val - cutoff) / max(1.0 - cutoff, 1e-8)) * eps_max
+            return ((t_val - cutoff) / (1.0 - cutoff)) * eps_max
         return eps_max
 
     def compute_loss(
@@ -257,16 +259,16 @@ class EM(nn.Module):
         targets: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         recon_weight: float = 1.0,
-        property_weight: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Energy-matching flow loss (+ optional CD) and property MSE.
+
+        Flow + CD mirrors train_proteins.py; property MSE is the RNA joint head.
 
         Args:
             x_0: token ids ``[B, L]``
             targets: property labels ``[B]`` or ``[B, P]``
             mask: bool pad mask True=valid ``[B, L]``
             recon_weight: weight on generative (flow + CD) loss
-            property_weight: weight on property MSE
 
         Returns:
             total_loss, gen_loss (flow[+CD]), property_loss, property_pred ``[B, P]``
@@ -279,7 +281,7 @@ class EM(nn.Module):
         x0 = self._ot_couple(x0, x1)
 
         t = torch.rand(x1.shape[0], device=x1.device)
-        # Broadcast t for interpolation: x_t = (1-t) x0 + t x1
+        # CFM path: x_t = (1-t) x0 + t x1, u_t = x1 - x0
         t_ = t.view(-1, *([1] * (x1.ndim - 1)))
         xt = (1.0 - t_) * x0 + t_ * x1
         ut = x1 - x0
@@ -290,12 +292,14 @@ class EM(nn.Module):
             m = mask.float().unsqueeze(-1)
             per = (flow_mse * m).sum(dim=(1, 2)) / (m.sum(dim=(1, 2)).clamp(min=1.0) * self.vocab_size)
         else:
-            per = flow_mse.reshape(flow_mse.shape[0], -1).mean(dim=1)
+            # Official: mean over spatial dims then over batch with flow_weight.
+            per = flow_mse.mean(dim=tuple(range(1, flow_mse.ndim)))
         w = self._flow_weight(t, cutoff=self.time_cutoff)
         flow_loss = (w * per).mean()
 
         gen_loss = flow_loss
         if self.lambda_cd > 0.0 and self.n_gibbs > 0:
+            # CD at t=1 only (official train_proteins.py).
             pos_energy = self.potential(x1, t=torch.ones_like(t), pad_mask=mask)
             n = x1.shape[0]
             half = n // 2
@@ -316,7 +320,7 @@ class EM(nn.Module):
                 targets = targets.unsqueeze(-1)
             prop_loss = F.mse_loss(prop_pred, targets)
 
-        total = recon_weight * gen_loss + property_weight * prop_loss
+        total = recon_weight * gen_loss + prop_loss
         return total, gen_loss, prop_loss, prop_pred
 
     def _gibbs_time_sweep(
@@ -326,26 +330,40 @@ class EM(nn.Module):
         at_data_mask: torch.Tensor,
         pad_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """MALA negatives with piecewise epsilon(t) (official protein CD)."""
+        """MALA negatives with piecewise epsilon(t) (official gibbs_sampling_time_sweep)."""
         samples = x_init.clone().detach()
         n_steps = max(int(self.n_gibbs), 1)
         dt = float(self.dt_gibbs)
+        at_data_mask = at_data_mask.to(device=samples.device, dtype=torch.bool)
         for i in range(n_steps):
             t_val = i * dt
             e = torch.zeros(samples.shape[0], device=samples.device, dtype=samples.dtype)
-            # Not-at-data: schedule; at-data: epsilon_max.
             scheduled = self._epsilon(t_val)
             e[~at_data_mask] = scheduled
             e[at_data_mask] = self.epsilon_max
             noise_std = torch.sqrt(torch.clamp(2.0 * dt * e, min=0.0))
 
-            samples = samples.detach().requires_grad_(True)
-            v = self.potential(samples, pad_mask=pad_mask)
-            grad_v = torch.autograd.grad(v.sum(), samples, create_graph=False)[0]
+            # Official: create_graph=False for CD negatives; clamp once after loop.
+            with torch.enable_grad():
+                samples = samples.detach().requires_grad_(True)
+                with _math_sdp():
+                    t_tensor = torch.full(
+                        (samples.shape[0],),
+                        t_val,
+                        device=samples.device,
+                        dtype=samples.dtype,
+                    )
+                    v = self.potential(samples, t=t_tensor, pad_mask=pad_mask)
+                    grad_v = torch.autograd.grad(
+                        v,
+                        samples,
+                        grad_outputs=torch.ones_like(v),
+                        create_graph=False,
+                    )[0]
             with torch.no_grad():
                 noise = torch.randn_like(samples) * noise_std.view(-1, *([1] * (samples.ndim - 1)))
-                samples = (samples - dt * grad_v + noise).clamp(-1.0, 1.0)
-        return samples.detach()
+                samples = samples - dt * grad_v + noise
+        return samples.detach().clamp(-1.0, 1.0)
 
     def _property_grad(
         self,
@@ -355,11 +373,12 @@ class EM(nn.Module):
         direction: float,
         guide_scale: float,
     ) -> torch.Tensor:
-        """``direction * guide_scale * ∇_x property(x)``."""
-        x_req = x.detach().requires_grad_(True)
-        pred = self.predict_property(x_req, pad_mask=pad_mask)
-        objective = (direction * pred).sum()
-        return guide_scale * torch.autograd.grad(objective, x_req, create_graph=False)[0]
+        """``direction * guide_scale * grad_x property(x)`` (RNA guidance; not in official EM)."""
+        with torch.enable_grad():
+            x_req = x.detach().requires_grad_(True)
+            pred = self.predict_property(x_req, pad_mask=pad_mask)
+            objective = (direction * pred).sum()
+            return guide_scale * torch.autograd.grad(objective, x_req, create_graph=False)[0]
 
     @torch.no_grad()
     def _decode_tokens(self, x: torch.Tensor) -> torch.Tensor:
@@ -379,11 +398,11 @@ class EM(nn.Module):
         pad_mask: Optional[torch.Tensor] = None,
         return_traj: bool = False,
     ):
-        """Euler–Maruyama sampling of ``dx = -∇V dt + √(2 ε(t) dt) dW``.
+        """Euler-Maruyama: ``dx = -grad V dt + sqrt(2 eps(t) dt) dW`` (official sde_euler_maruyama).
 
         If ``seed_tokens`` is given, start from a noisy continuous embedding of
         those sequences (optimization / local refinement); otherwise from
-        Gaussian noise (de novo).
+        Gaussian noise (de novo). Property guidance is an RNA-only addition.
         """
         if seed_tokens is None:
             x = torch.randn(batch_size, self.seq_len, self.vocab_size, device=self.device)
@@ -400,28 +419,27 @@ class EM(nn.Module):
         times = torch.arange(0.0, float(t_end) + 1e-8, float(dt), device=self.device)
         traj = []
         for t_val in times:
-            e = self._epsilon(float(t_val.item()))
-            # Velocity / property grads need autograd even under @torch.no_grad sample.
-            with torch.enable_grad():
-                x_req = x.detach().requires_grad_(True)
-                v = self.potential(x_req, pad_mask=pad_mask)
-                drift = -torch.autograd.grad(v.sum(), x_req, create_graph=False)[0]
-                if guidance and self.num_properties > 0 and guide_scale != 0.0:
-                    # Ascend property when direction > 0.
-                    drift = drift + self._property_grad(
-                        x,
-                        pad_mask=pad_mask,
-                        direction=float(direction),
-                        guide_scale=float(guide_scale),
-                    )
-            noise = torch.randn_like(x)
-            sigma = math.sqrt(max(2.0 * e * float(dt), 0.0))
-            x = (x + float(dt) * drift.detach() + sigma * noise).clamp(-1.0, 1.0)
             if return_traj:
                 traj.append(self._decode_tokens(x).detach())
+            e = self._epsilon(float(t_val.item()))
+            # Official model(t, x) -> velocity (enable_grad + create_graph inside).
+            drift = self.velocity(x, t=t_val.expand(x.shape[0]), pad_mask=pad_mask)
+            if guidance and self.num_properties > 0 and guide_scale != 0.0:
+                drift = drift + self._property_grad(
+                    x,
+                    pad_mask=pad_mask,
+                    direction=float(direction),
+                    guide_scale=float(guide_scale),
+                )
+            noise = torch.randn_like(x)
+            sigma = math.sqrt(max(2.0 * e * float(dt), 0.0))
+            x = x + float(dt) * drift.detach() + sigma * noise
 
+        # Official clamps once at the end (one-hot / continuous box).
+        x = x.clamp(-1.0, 1.0)
         tokens = self._decode_tokens(x)
         if return_traj:
+            traj.append(tokens.detach())
             return tokens, torch.stack(traj, dim=0) if traj else tokens.unsqueeze(0)
         return tokens
 
@@ -478,6 +496,11 @@ if __name__ == "__main__":
     assert total.ndim == 0 and pred.shape == (batch_size, 1)
     assert gen.ndim == 0 and prop.ndim == 0
     assert torch.isfinite(total)
+
+    model.eval()
+    with torch.no_grad():
+        total_e, _, _, _ = model.compute_loss(sequences, targets=targets, mask=mask)
+        assert torch.isfinite(total_e)
 
     generated = model.sample(batch_size=batch_size, t_end=0.2, dt=0.05, guidance=False)
     assert generated.shape == (batch_size, seq_len)

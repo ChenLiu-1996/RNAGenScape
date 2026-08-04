@@ -6,8 +6,8 @@ Example:
 Saves ``results/<dataset>/<model>/seed_{seed}/model.pt`` (plus ``label_stats.json``,
 ``train_meta.json``, ``train.log``).
 
-Optimization matches OAE training: AdamW + linear-warmup cosine annealing,
-early stop on val combined loss.
+Loss: ``recon_w * gen + property_mse``.
+Optimization: AdamW + linear-warmup cosine annealing, early stop on val loss.
 """
 
 from __future__ import annotations
@@ -158,10 +158,10 @@ def _batch_loss(
     y: torch.Tensor,
     *,
     recon_w: float,
-    property_w: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return (total_loss, gen_loss, property_mse, y_hat [B]).
 
+    Total is ``recon_w * gen + property_mse``.
     ``gen_loss`` is the model-specific generative term; see ``GEN_LOSS_NAME``.
     """
     token_ids = to_token_ids(x)
@@ -172,7 +172,7 @@ def _batch_loss(
         losses, y_hat = model.compute_loss(token_ids, targets=targets, mask=mask)
         recon = losses["recon_loss"]
         prop = losses["property_loss"]
-        total = recon_w * recon + property_w * prop
+        total = recon_w * recon + prop
         return total, recon, prop, y_hat.view(-1)
 
     if model_name in ("NOS_C", "NOS_D", "gg_dWJS", "EM", "MPGD", "MFM", "PCD"):
@@ -181,7 +181,6 @@ def _batch_loss(
             targets=targets.unsqueeze(-1),
             mask=mask,
             recon_weight=recon_w,
-            property_weight=property_w,
         )
         return total, recon, prop, y_hat.view(-1)
 
@@ -197,7 +196,6 @@ def _batch_loss(
             mask_start,
             mask_end,
             recon_weight=recon_w,
-            property_weight=property_w,
         )
         return total, recon, prop, y_hat.view(-1)
 
@@ -212,7 +210,6 @@ def evaluate(
     *,
     device: str,
     recon_w: float,
-    property_w: float,
 ) -> Dict[str, float]:
     model.eval()
     y_true: List[float] = []
@@ -225,7 +222,7 @@ def evaluate(
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         loss, recon, prop, y_hat = _batch_loss(
-            model_name, model, x, y, recon_w=recon_w, property_w=property_w
+            model_name, model, x, y, recon_w=recon_w
         )
         total_loss += float(loss.item())
         total_recon += float(recon.item())
@@ -255,7 +252,6 @@ def train(
     *,
     device: str,
     recon_w: float,
-    property_w: float,
     optimizer: torch.optim.Optimizer,
     lr_scheduler: torch.optim.lr_scheduler._LRScheduler | None,
     max_epochs: int,
@@ -292,7 +288,7 @@ def train(
             for x, y in train_loader:
                 x, y = x.to(device), y.to(device)
                 loss, gen, prop, y_hat = _batch_loss(
-                    model_name, model, x, y, recon_w=recon_w, property_w=property_w
+                    model_name, model, x, y, recon_w=recon_w
                 )
                 optimizer.zero_grad()
                 loss.backward()
@@ -325,7 +321,6 @@ def train(
                 val_loader,
                 device=device,
                 recon_w=recon_w,
-                property_w=property_w,
             )
 
             line = (
@@ -373,7 +368,6 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--recon_w", type=float, default=1.0, help="Weight on generative / reconstruction loss.")
-    p.add_argument("--property_w", type=float, default=1.0, help="Weight on property MSE loss.")
     p.add_argument("--max_epochs", type=int, default=200)
     p.add_argument("--patience", type=int, default=20, help="Early stop patience on val loss.")
     p.add_argument("--label_norm", type=str, default="normal", choices=["none", "normal", "minmax"])
@@ -400,7 +394,7 @@ def main() -> None:
     print(
         f"dataset={args.dataset} model={args.model} seed={args.seed} "
         f"n_train={info.n_train} n_val={info.n_val} n_test={info.n_test} "
-        f"label_norm={args.label_norm} recon_w={args.recon_w} property_w={args.property_w}"
+        f"label_norm={args.label_norm} recon_w={args.recon_w}"
     )
 
     model = build_model(args.model, seq_len=seq_len, device=device)
@@ -433,7 +427,6 @@ def main() -> None:
         "seed": args.seed,
         "seq_len": seq_len,
         "recon_w": args.recon_w,
-        "property_w": args.property_w,
         "gen_loss_name": gen_name,
         "property_loss_name": PROP_LOSS_NAME,
         "lr": args.lr,
@@ -466,7 +459,6 @@ def main() -> None:
         val_loader,
         device=device,
         recon_w=args.recon_w,
-        property_w=args.property_w,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         max_epochs=args.max_epochs,
@@ -481,7 +473,6 @@ def main() -> None:
         test_loader,
         device=device,
         recon_w=args.recon_w,
-        property_w=args.property_w,
     )
     print(
         f"test loss={test['loss']:.4f} {gen_name}={test[gen_name]:.4f} "

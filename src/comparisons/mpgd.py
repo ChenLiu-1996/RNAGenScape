@@ -190,7 +190,6 @@ class MPGD(nn.Module):
         targets: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         recon_weight: float = 1.0,
-        property_weight: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Diffusion noise MSE (+ AE recon) and property MSE.
 
@@ -236,7 +235,7 @@ class MPGD(nn.Module):
                 targets = targets.unsqueeze(-1)
             prop_loss = F.mse_loss(prop_pred, targets)
 
-        total = recon_weight * gen_loss + property_weight * prop_loss
+        total = recon_weight * gen_loss + prop_loss
         return total, gen_loss, prop_loss, prop_pred
 
     def _guidance_step(

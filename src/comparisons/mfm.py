@@ -352,7 +352,6 @@ class MFM(nn.Module):
         targets: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         recon_weight: float = 1.0,
-        property_weight: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Population Metric-CFM (both directions) + property MSE.
 
@@ -361,7 +360,6 @@ class MFM(nn.Module):
             targets: property labels ``[B]`` or ``[B, P]`` (required for split)
             mask: bool pad mask True=valid ``[B, L]``
             recon_weight: weight on generative (flow + geopath) loss
-            property_weight: weight on property MSE
 
         Returns:
             total_loss, gen_loss, property_loss, property_pred ``[B, P]``
@@ -398,7 +396,7 @@ class MFM(nn.Module):
             targets = targets.unsqueeze(-1)
         prop_loss = F.mse_loss(prop_pred, targets)
 
-        total = recon_weight * gen_loss + property_weight * prop_loss
+        total = recon_weight * gen_loss + prop_loss
         return total, gen_loss, prop_loss, prop_pred
 
     @torch.no_grad()

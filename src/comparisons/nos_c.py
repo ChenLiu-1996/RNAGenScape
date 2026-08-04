@@ -189,7 +189,7 @@ class NOS_C(nn.Module):
 
         return x_t, noise
 
-    def compute_loss(self, x_0, targets=None, mask=None, recon_weight=1.0, property_weight=0.1):
+    def compute_loss(self, x_0, targets=None, mask=None, recon_weight=1.0):
         """
         Compute training loss
 
@@ -219,7 +219,7 @@ class NOS_C(nn.Module):
         if targets is not None:
             prop_loss = F.mse_loss(property_pred, targets)
 
-        total_loss = recon_weight * recon_loss + property_weight * prop_loss
+        total_loss = recon_weight * recon_loss + prop_loss
 
         return total_loss, recon_loss, prop_loss, property_pred
 

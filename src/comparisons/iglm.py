@@ -225,7 +225,7 @@ class IgLM(nn.Module):
         return nn.functional.mse_loss(pred_properties.squeeze(-1), target_properties)
 
     def compute_loss(self, sequences, target_properties, mask_start, mask_end,
-                     recon_weight=1.0, property_weight=0.1):
+                     recon_weight=1.0):
         """
         Joint training loss for language modeling + property prediction
 
@@ -235,7 +235,6 @@ class IgLM(nn.Module):
             mask_start: Start position of mask
             mask_end: End position of mask
             recon_weight: Weight for language modeling loss
-            property_weight: Weight for property prediction loss
 
         Returns:
             total_loss: Total loss
@@ -255,7 +254,7 @@ class IgLM(nn.Module):
 
         lm_loss = self.infilling_loss(lm_logits, sequences_iglm, attention_mask_lm)
         prop_loss = self.regression_loss(pred_properties, target_properties)
-        total_loss = recon_weight * lm_loss + property_weight * prop_loss
+        total_loss = recon_weight * lm_loss + prop_loss
         return total_loss, lm_loss, prop_loss, pred_properties
 
     @torch.no_grad()
@@ -479,7 +478,7 @@ def training_step(model, batch, optimizer):
     mask_end = min(mask_start + mask_len, seq_len - 1)
 
     total_loss, lm_loss, prop_loss, pred_properties = model.compute_loss(
-        sequences, targets, mask_start, mask_end, recon_weight=1.0, property_weight=1.0)
+        sequences, targets, mask_start, mask_end, recon_weight=1.0)
 
     batch_loss_dict = {
         'loss': total_loss,
