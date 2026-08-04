@@ -46,7 +46,7 @@ for data in "${DATASETS[@]}"; do
         KNN_K="${proj_cfg#knn:}"
         PROJ_TAG="knn_k${KNN_K}"
       fi
-      EXPERIMENT="${DIR_TAG}_samehyper_sugar0p0_${PROJ_TAG}"
+      EXPERIMENT="${DIR_TAG}_samehyper_sugar0e0_${PROJ_TAG}"
 
       for seed in "${SEEDS[@]}"; do
         echo "========== Generate ${data} ${EXPERIMENT} seed=${seed} D=${LATENT_DIM} recon_w=${RECON_W} =========="
@@ -85,7 +85,8 @@ for data in "${DATASETS[@]}"; do
   done
 done
 
+RECON_TAG="$(PYTHONPATH="${ROOT_DIR}/src" python -c "from utils.results import float_tag; print(float_tag(float('${RECON_W}')))")"
 echo "Done."
-echo "  checkpoints: results/<dataset>/OAE/d${LATENT_DIM}_recon${RECON_W//./p}/seed_*/model.pt (+ dae/knn projector)"
-echo "  generation:  results/<dataset>/OAE/d${LATENT_DIM}_recon${RECON_W//./p}/<experiment>/seed_*/generation.npz"
-echo "  evaluation:  results/<dataset>/OAE/d${LATENT_DIM}_recon${RECON_W//./p}/<experiment>/evaluation/"
+echo "  checkpoints: results/<dataset>/OAE/d${LATENT_DIM}_recon${RECON_TAG}/seed_*/model.pt (+ dae/knn projector)"
+echo "  generation:  results/<dataset>/OAE/d${LATENT_DIM}_recon${RECON_TAG}/<experiment>/seed_*/generation.npz"
+echo "  evaluation:  results/<dataset>/OAE/d${LATENT_DIM}_recon${RECON_TAG}/<experiment>/evaluation/"

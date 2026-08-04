@@ -4,7 +4,7 @@ Example:
   python src/evaluation/eval_edit_efficiency.py \\
     --dataset OpenVaccine \\
     --model OAE \\
-    --experiment pos_samehyper_sugar1p0 \\
+    --experiment pos_samehyper_sugar1e0 \\
     --oracle UTRLM
 """
 

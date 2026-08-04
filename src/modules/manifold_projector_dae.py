@@ -165,7 +165,7 @@ def train_manifold_projector_dae(
 ) -> tuple[ManifoldProjectorDAE, List[Dict[str, List[float]]], Dict[str, float]]:
     """Noise-curriculum DAE training on latent points ``X`` ``[N, D]``.
 
-    Split is 20% train / 40% val / 40% test (legacy RNAGenScape / paper path).
+    Split is 20% train / 40% val / 40% test.
     """
     noise_levels = list(noise_levels)
     learning_rates = [learning_rate] * len(noise_levels)

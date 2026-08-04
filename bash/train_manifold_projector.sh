@@ -46,4 +46,4 @@ for data in "${DATASETS[@]}"; do
   done
 done
 
-echo "Done. Checkpoints under results/<dataset>/OAE/d${LATENT_DIM}_recon${RECON_W//./p}/seed_*/"
+echo "Done. Checkpoints under results/<dataset>/OAE/d${LATENT_DIM}_recon$(PYTHONPATH="${ROOT_DIR}/src" python -c "from utils.results import float_tag; print(float_tag(float('${RECON_W}')))")/seed_*/"

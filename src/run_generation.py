@@ -6,7 +6,7 @@ Later: denovo / guided / simple_opt handlers behind ``--method``.
 Example:
   python src/run_generation.py \\
     --dataset OpenVaccine --method rnagenscape --model OAE \\
-    --experiment pos_samehyper_sugar0p0 --seed 1 --direction 1 \\
+    --experiment pos_samehyper_sugar0e0 --seed 1 --direction 1 \\
     --projector dae --sugar_w 0.0 --num_steps 100 --step_size 5e-3 --temperature 1e-3
 
 ``--seed`` selects the trained OAE / projector under

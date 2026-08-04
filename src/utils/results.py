@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -58,14 +59,24 @@ def results_root(root: Optional[str] = None) -> str:
     return os.path.join(root or repo_root(), "results")
 
 
-def _float_tag(value: float) -> str:
-    """Encode a float for path segments (``5.0`` -> ``5p0``, ``1e-4`` stays ``0p0001``)."""
-    return str(float(value)).replace(".", "p")
+def float_tag(value: float) -> str:
+    """Encode a float for path segments via compact scientific notation.
+
+    Examples: ``5.0`` -> ``5e0``, ``0.5`` -> ``5e-1``, ``1e-4`` -> ``1e-4``.
+    Coefficient is an integer (no ``.`` in the tag).
+    """
+    d = Decimal(f"{float(value):.12g}").normalize()
+    sign, digits, exp = d.as_tuple()
+    if not digits or digits == (0,):
+        return "0e0"
+    coeff = int("".join(str(dig) for dig in digits))
+    prefix = "-" if sign else ""
+    return f"{prefix}{coeff}e{int(exp)}"
 
 
 def oae_config_tag(latent_dim: int, recon_w: float) -> str:
-    """Ablation folder for an OAE variant: ``d128_recon5p0``."""
-    return f"d{int(latent_dim)}_recon{_float_tag(recon_w)}"
+    """Ablation folder for an OAE variant: ``d128_recon5e0``."""
+    return f"d{int(latent_dim)}_recon{float_tag(recon_w)}"
 
 
 def oae_config_dir(
@@ -159,8 +170,8 @@ def baseline_checkpoint_path(
 
 
 def _sugar_tag(sugar_w: float) -> str:
-    """Encode sugar weight for path segments (``1.0`` -> ``1p0``)."""
-    return _float_tag(sugar_w)
+    """Encode sugar weight for path segments (``1.0`` -> ``1e0``, ``0.5`` -> ``5e-1``)."""
+    return float_tag(sugar_w)
 
 
 def normalize_latent_norm_name(latent_normalization: str) -> str:
@@ -262,10 +273,7 @@ def evaluation_dir(exp_dir: str) -> str:
 
 
 def discover_seed_runs(exp_dir: str) -> List[Tuple[int, str]]:
-    """Return sorted (seed, run_dir) for directories with generation.npz under exp_dir/seed_*.
-
-    Also accepts legacy flat dirs named eval_seed{N}_... containing generation.npz.
-    """
+    """Return sorted (seed, run_dir) for directories with generation.npz under exp_dir/seed_*."""
     if not os.path.isdir(exp_dir):
         raise FileNotFoundError(f"Experiment directory not found: {exp_dir}")
 
@@ -279,23 +287,10 @@ def discover_seed_runs(exp_dir: str) -> List[Tuple[int, str]]:
         if m and os.path.isfile(os.path.join(path, GENERATION_FILENAME)):
             runs.append((int(m.group(1)), path))
 
-    if runs:
-        return sorted(runs, key=lambda x: x[0])
-
-    # Legacy: eval_seed{N}_tag/.../generation.npz
-    legacy_re = re.compile(r"eval_seed(\d+)_")
-    for name in sorted(os.listdir(exp_dir)):
-        path = os.path.join(exp_dir, name)
-        if not os.path.isdir(path):
-            continue
-        m = legacy_re.match(name)
-        if m and os.path.isfile(os.path.join(path, GENERATION_FILENAME)):
-            runs.append((int(m.group(1)), path))
-
     if not runs:
         raise FileNotFoundError(
             f"No seed runs with {GENERATION_FILENAME} under {exp_dir}. "
-            "Expected seed_*/generation.npz (or legacy eval_seed*_*/generation.npz)."
+            "Expected seed_*/generation.npz."
         )
     return sorted(runs, key=lambda x: x[0])
 

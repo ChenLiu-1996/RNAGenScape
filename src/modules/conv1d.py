@@ -168,11 +168,6 @@ class Conv1d(nn.Module):
             pred = pred.squeeze(-1)
         return self.loss_fn(pred, target)
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Dummy decode for API compatibility."""
-        batch_size = z.shape[0]
-        return torch.randn(batch_size, self.seq_len, self.vocab_size, device=z.device)
-
 
 if __name__ == "__main__":
     device = "cpu"
