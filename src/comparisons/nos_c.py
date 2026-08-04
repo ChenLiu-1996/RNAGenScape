@@ -329,6 +329,58 @@ class NOS_C(nn.Module):
         x_t = x_t.detach()
         return self._denoising_step(x_t, t, mask)
 
+    def optimize(
+        self,
+        sequences,
+        *,
+        target_direction="increase",
+        num_steps=10,
+        step_size=0.1,
+        stability_coef=5.0,
+        target_abs=1.0,
+        mask=None,
+    ):
+        """Guided denoising starting from seed sequences ``[B, L]``."""
+        sequences = sequences.to(self.device)
+        if sequences.dim() == 1:
+            sequences = sequences.unsqueeze(0)
+        batch_size = sequences.shape[0]
+        if mask is None:
+            mask = (sequences != 0).float()
+        else:
+            mask = mask.float().to(self.device)
+
+        target = float(target_abs) if target_direction == "increase" else -float(target_abs)
+        guidance_kwargs = {
+            "step_size": float(step_size),
+            "stability_coef": float(stability_coef),
+            "target_values": [target],
+        }
+
+        # Forward-corrupt seed embeddings, then reverse with property guidance.
+        steps = max(int(num_steps), 1)
+        t0 = torch.full(
+            (batch_size,),
+            max(steps - 1, 0) * (self.max_timesteps // steps),
+            device=self.device,
+            dtype=torch.long,
+        )
+        x, _ = self.add_noise(sequences, t0)
+        for i in reversed(range(steps)):
+            t = torch.full(
+                (batch_size,),
+                i * (self.max_timesteps // steps),
+                device=self.device,
+                dtype=torch.long,
+            )
+            x = self._guided_step(x, t, guidance_kwargs, mask)
+
+        with torch.no_grad():
+            token_logits = self.token_embedding.weight @ x.transpose(-2, -1)
+            token_logits = token_logits.transpose(-2, -1)
+            tokens = torch.argmax(token_logits, dim=-1)
+        return tokens
+
     def generate_sequences(self, batch_size, num_steps=50, guidance_kwargs=None, mask=None):
         """
         Generate RNA sequences as strings

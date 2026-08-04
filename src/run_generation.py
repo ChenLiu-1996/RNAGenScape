@@ -1,16 +1,20 @@
 """Unified generation entrypoint.
 
-Phase 1: RNAGenScape (OAE + manifold Langevin + projector).
-Later: denovo / guided / simple_opt handlers behind ``--method``.
+Methods:
+  * ``rnagenscape`` -- OAE + manifold Langevin + projector (RNAGenScape).
+  * ``guided`` -- property-guided optimization of test starts (all baselines).
+  * ``denovo`` -- unconditional generation (not implemented yet).
 
-Example:
+Examples:
   python src/run_generation.py \\
     --dataset OpenVaccine --method rnagenscape --model OAE \\
     --experiment pos_samehyper_sugar0e0 --seed 1 --direction 1 \\
     --projector dae --sugar_w 0.0 --num_steps 100 --step_size 5e-3 --temperature 1e-3
 
-``--seed`` selects the trained OAE / projector under
-``results/<dataset>/OAE/d{latent}_recon{w}/seed_{seed}/``.
+  python src/run_generation.py \\
+    --dataset OpenVaccine --method guided --model DiffAb \\
+    --experiment pos_guided --seed 1 --direction 1 \\
+    --num_steps 10 --forward_steps 10 --num_candidates 10
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ import argparse
 import json
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -34,9 +38,11 @@ from modules.langevin import run_manifold_langevin
 from modules.manifold_projector_dae import load_manifold_projector_dae
 from modules.manifold_projector_knn import ManifoldProjectorKNN
 from modules.oae import OAE, load_oae
+from train_baseline import BASELINE_MODELS, build_model
 from utils.metrics import VOCAB_SIZE, to_token_ids
 from utils.oracle import resolve_device
 from utils.results import (
+    baseline_checkpoint_path,
     experiment_dir,
     latent_trainset_path,
     load_generation_artifact,
@@ -47,8 +53,66 @@ from utils.results import (
 )
 from utils.training_utils import seed_everything
 
-METHODS = ("rnagenscape", "denovo", "guided", "simple_opt")
+METHODS = ("rnagenscape", "guided", "denovo")
 DEFAULT_DAE_HIDDEN_DIMS = (32, 16, 32)
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def direction_to_target(direction: float) -> str:
+    return "increase" if float(direction) > 0 else "decrease"
+
+
+def pad_mask(token_ids: torch.Tensor) -> torch.Tensor:
+    return token_ids != 0
+
+
+@torch.no_grad()
+def collect_tokens_and_labels(loader, *, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return (token_ids [N,L], labels [N]) from a dataloader."""
+    tokens: List[torch.Tensor] = []
+    labels: List[torch.Tensor] = []
+    for x, y in loader:
+        x = x.to(device)
+        tokens.append(to_token_ids(x).detach().cpu())
+        labels.append(y.detach().cpu().float().reshape(-1))
+    return torch.cat(tokens, dim=0), torch.cat(labels, dim=0)
+
+
+def subsample_token_starts(
+    pool_x: torch.Tensor,
+    pool_y: torch.Tensor,
+    *,
+    subsample_seed: int,
+) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray]:
+    """Same 25%/all rule as RNAGenScape start pooling."""
+    n = pool_x.shape[0]
+    sample_size = int(n * 0.25) if n >= 20000 else n
+    rng = np.random.default_rng(seed=subsample_seed)
+    indices = rng.choice(n, size=sample_size, replace=False)
+    indices_t = torch.from_numpy(indices.astype(np.int64))
+    return pool_x[indices_t], pool_y[indices_t], indices
+
+
+def load_json_label_stats(path: str) -> Dict[str, float]:
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Missing label stats: {path}")
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    return {
+        "label_mean": float(raw["label_mean"]),
+        "label_std": float(raw["label_std"]),
+        "label_min": float(raw["label_min"]),
+        "label_max": float(raw["label_max"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# RNAGenScape (OAE + Langevin + projector)
+# ---------------------------------------------------------------------------
 
 
 def load_oae_model(
@@ -85,16 +149,7 @@ def load_label_stats(
         ),
         "label_stats.json",
     )
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Missing label stats: {path}")
-    with open(path, encoding="utf-8") as f:
-        raw = json.load(f)
-    return {
-        "label_mean": float(raw["label_mean"]),
-        "label_std": float(raw["label_std"]),
-        "label_min": float(raw["label_min"]),
-        "label_max": float(raw["label_max"]),
-    }
+    return load_json_label_stats(path)
 
 
 def apply_latent_normalization(
@@ -371,23 +426,231 @@ def run_rnagenscape(args, device: str) -> str:
     return path
 
 
-def run_denovo(args, device: str) -> str:
-    raise NotImplementedError("method=denovo is Phase 3 (not implemented yet).")
+# ---------------------------------------------------------------------------
+# Baseline guided optimization (test starts -> model.optimize)
+# ---------------------------------------------------------------------------
+
+
+def load_baseline_model(model_name: str, *, dataset: str, seed: int, device: str) -> torch.nn.Module:
+    ckpt = baseline_checkpoint_path(dataset, model_name, seed)
+    if not os.path.isfile(ckpt):
+        raise FileNotFoundError(
+            f"Missing baseline checkpoint: {ckpt}. "
+            f"Train with src/train_baseline.py --model {model_name} --seed {seed}."
+        )
+    seq_len = int(DATASET_CONFIG[dataset]["seq_len"])
+    model = build_model(model_name, seq_len=seq_len, device=device)
+    state = torch.load(ckpt, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
+
+def load_baseline_label_stats(dataset: str, model_name: str, seed: int) -> Dict[str, float]:
+    path = os.path.join(
+        os.path.dirname(baseline_checkpoint_path(dataset, model_name, seed)),
+        "label_stats.json",
+    )
+    return load_json_label_stats(path)
+
+
+def optimize_baseline_batch(
+    model_name: str,
+    model: torch.nn.Module,
+    starts: torch.Tensor,
+    *,
+    args,
+    device: str,
+) -> torch.Tensor:
+    """Run one batch of seed-started property optimization. Returns tokens ``[B, L]``."""
+    starts = starts.to(device)
+    mask = pad_mask(starts)
+    target = direction_to_target(args.direction)
+
+    if model_name == "DiffAb":
+        traj = model.optimize(
+            starts,
+            device=device,
+            target_direction=target,
+            num_candidates=args.num_candidates,
+            forward_steps=args.forward_steps,
+            mask=mask,
+        )
+        # optimize returns full trajectory [T, B, L]; take the final sequences.
+        return traj[-1].detach().cpu()
+
+    if model_name == "IgLM":
+        seq_len = starts.shape[1]
+        return model.optimize(
+            starts,
+            target_direction=target,
+            span_start=0,
+            span_end=seq_len - 1,
+            num_candidates=args.num_candidates,
+        ).detach().cpu()
+
+    if model_name == "NOS_C":
+        return model.optimize(
+            starts,
+            target_direction=target,
+            num_steps=args.num_steps,
+            step_size=args.step_size,
+            stability_coef=args.stability_coef,
+            target_abs=abs(float(args.direction)),
+            mask=mask.float(),
+        ).detach().cpu()
+
+    if model_name == "NOS_D":
+        return model.optimize(
+            starts,
+            target_direction=target,
+            num_steps=args.num_steps,
+            step_size=args.step_size,
+            stability_coef=args.stability_coef,
+            target_abs=abs(float(args.direction)),
+            mask=mask,
+            use_reveal_schedule=True,
+        ).detach().cpu()
+
+    if model_name == "gg_dWJS":
+        return model.optimize(
+            starts,
+            target_direction=target,
+            num_steps=args.num_steps,
+            guide_scale=args.guide_scale,
+            pad_mask=mask,
+        ).detach().cpu()
+
+    if model_name == "EM":
+        return model.optimize(
+            starts,
+            target_direction=target,
+            t_end=float(args.t_end),
+            dt=float(args.dt),
+            guide_scale=args.guide_scale,
+            pad_mask=mask,
+        ).detach().cpu()
+
+    if model_name == "MPGD":
+        return model.optimize(
+            starts,
+            target_direction=target,
+            num_steps=args.num_steps,
+            guide_scale=args.guide_scale,
+            pad_mask=mask,
+        ).detach().cpu()
+
+    if model_name == "MFM":
+        return model.optimize(
+            starts,
+            target_direction=target,
+            num_steps=args.num_steps,
+            pad_mask=mask,
+        ).detach().cpu()
+
+    if model_name == "PCD":
+        return model.optimize(
+            starts,
+            target_direction=target,
+            num_steps=args.num_steps,
+            guide_scale=args.guide_scale,
+            pad_mask=mask,
+        ).detach().cpu()
+
+    raise ValueError(f"No guided optimize path for model '{model_name}'.")
 
 
 def run_guided(args, device: str) -> str:
-    raise NotImplementedError("method=guided is Phase 3 (not implemented yet).")
+    if args.model not in BASELINE_MODELS:
+        raise ValueError(
+            f"method=guided requires a baseline --model in {BASELINE_MODELS}; "
+            f"got '{args.model}'. For OAE use --method rnagenscape."
+        )
+
+    model = load_baseline_model(
+        args.model, dataset=args.dataset, seed=args.seed, device=device
+    )
+    label_stats = load_baseline_label_stats(args.dataset, args.model, args.seed)
+
+    _train_loader, _val_loader, test_loader, info = make_dataloaders(
+        args.dataset,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        representation="one_hot",
+        label_norm="normal",
+        num_workers=args.num_workers,
+    )
+    print(
+        f"dataset={args.dataset} n_train={info.n_train} n_test={info.n_test} "
+        f"model={args.model} seed={args.seed} direction={args.direction}"
+    )
+
+    pool_x, pool_y = collect_tokens_and_labels(test_loader, device=device)
+    seed_everything(args.subsample_seed)
+    sampled_x, sampled_y, sampled_indices = subsample_token_starts(
+        pool_x, pool_y, subsample_seed=args.subsample_seed
+    )
+    print(
+        f"start pool={pool_x.shape[0]} starts={sampled_x.shape[0]} "
+        f"subsample_seed={args.subsample_seed}"
+    )
+
+    seed_everything(args.seed)
+    outs: List[torch.Tensor] = []
+    for i in range(0, sampled_x.shape[0], args.batch_size):
+        batch = sampled_x[i : i + args.batch_size]
+        outs.append(
+            optimize_baseline_batch(
+                args.model, model, batch, args=args, device=device
+            )
+        )
+    new_sequences = torch.cat(outs, dim=0)
+    assert new_sequences.shape[0] == sampled_x.shape[0]
+
+    out_dir = os.path.join(
+        experiment_dir(args.dataset, args.model, args.experiment),
+        f"seed_{args.seed}",
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    path = save_generation_artifact(
+        out_dir,
+        new_sequences=new_sequences,
+        sampled_X=sampled_x,
+        sampled_Y=sampled_y,
+        sampled_indices=sampled_indices,
+        sampling_pool_X=pool_x,
+        direction=float(args.direction),
+        train_stats=label_stats,
+        model_type=args.model,
+        data=args.dataset,
+        seed=args.seed,
+        subsample_seed=args.subsample_seed,
+        trajectories=None,
+        trajectories_are_sequences=False,
+        sugar_w=0.0,
+        extra_meta={
+            "method": args.method,
+            "num_steps": int(args.num_steps),
+            "step_size": float(args.step_size),
+            "guide_scale": float(args.guide_scale),
+            "num_candidates": int(args.num_candidates),
+            "forward_steps": int(args.forward_steps),
+            "stability_coef": float(args.stability_coef),
+        },
+    )
+    print(f"wrote {path}")
+    return path
 
 
-def run_simple_opt(args, device: str) -> str:
-    raise NotImplementedError("method=simple_opt is Phase 2 (not implemented yet).")
+def run_denovo(args, device: str) -> str:
+    del args, device
+    raise NotImplementedError("method=denovo is not implemented yet.")
 
 
 METHOD_FNS = {
     "rnagenscape": run_rnagenscape,
-    "denovo": run_denovo,
     "guided": run_guided,
-    "simple_opt": run_simple_opt,
+    "denovo": run_denovo,
 }
 
 
@@ -395,15 +658,15 @@ def parse_args():
     p = argparse.ArgumentParser(description="Run sequence generation (RNAGenScape / baselines).")
     p.add_argument("--dataset", type=str, required=True, choices=sorted(DATASET_NAMES))
     p.add_argument("--method", type=str, required=True, choices=METHODS)
-    p.add_argument("--model", type=str, required=True, help="Results folder name (e.g. OAE).")
+    p.add_argument("--model", type=str, required=True, help="Results folder name (OAE or a baseline).")
     p.add_argument("--experiment", type=str, required=True, help="Experiment id (no seed).")
-    p.add_argument("--seed", type=int, default=1, help="Training seed; loads OAE/projector under d*_recon*/seed_{seed}/.")
+    p.add_argument("--seed", type=int, default=1, help="Training seed; loads checkpoint under seed_{seed}/.")
     p.add_argument("--subsample_seed", type=int, default=42, help="RNG for start-pool subsample.")
     p.add_argument("--direction", type=float, default=1.0, help="+1 maximize / -1 minimize property.")
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--num_workers", type=int, default=0)
 
-    # OAE ablation folder (must match trained checkpoint)
+    # OAE ablation folder (rnagenscape only)
     p.add_argument("--latent_dim", type=int, default=128, help="OAE latent dim; path OAE/d{latent}_recon{w}/.")
     p.add_argument("--recon_w", type=float, default=5.0, help="OAE recon weight; path OAE/d{latent}_recon{w}/.")
 
@@ -413,9 +676,9 @@ def parse_args():
     p.add_argument("--latent_normalization", type=str, default="none", choices=["none", "normal", "minmax"])
     p.add_argument("--knn_k", type=int, default=1)
 
-    # Langevin
-    p.add_argument("--num_steps", type=int, default=100)
-    p.add_argument("--step_size", type=float, default=5e-3)
+    # Shared / Langevin / baseline step controls
+    p.add_argument("--num_steps", type=int, default=100, help="Langevin steps (OAE) or baseline optimize steps.")
+    p.add_argument("--step_size", type=float, default=5e-3, help="Langevin step (OAE) or NOS guidance step.")
     p.add_argument("--temperature", type=float, default=1e-3)
     p.add_argument("--step_size_rescale", type=float, default=None)
     p.add_argument("--use_fitness", action="store_true", default=True)
@@ -425,6 +688,14 @@ def parse_args():
     p.add_argument("--projector_iters", type=int, default=1)
     p.add_argument("--annealed", action="store_true", default=False)
     p.add_argument("--save_trajectories", action="store_true", default=False)
+
+    # Baseline guided optimization
+    p.add_argument("--num_candidates", type=int, default=10, help="DiffAb / IgLM candidate count.")
+    p.add_argument("--forward_steps", type=int, default=10, help="DiffAb forward-noise steps.")
+    p.add_argument("--stability_coef", type=float, default=5.0, help="NOS guidance stability coef.")
+    p.add_argument("--guide_scale", type=float, default=1.0, help="Property guidance scale (EM/MPGD/gg_dWJS/PCD).")
+    p.add_argument("--t_end", type=float, default=1.0, help="EM sampling end time.")
+    p.add_argument("--dt", type=float, default=0.01, help="EM Euler-Maruyama step.")
     return p.parse_args()
 
 
@@ -433,13 +704,11 @@ def main() -> None:
     device = resolve_device()
     print(f"device={device} method={args.method} model={args.model} experiment={args.experiment}")
     path = METHOD_FNS[args.method](args, device)
-    # Quick load check for rnagenscape.
-    if args.method == "rnagenscape":
-        art = load_generation_artifact(path)
-        print(
-            f"artifact OK new={tuple(art['new_sequences'].shape)} "
-            f"starts={tuple(art['sampled_X'].shape)} direction={art['direction']}"
-        )
+    art = load_generation_artifact(path)
+    print(
+        f"artifact OK new={tuple(art['new_sequences'].shape)} "
+        f"starts={tuple(art['sampled_X'].shape)} direction={art['direction']}"
+    )
 
 
 if __name__ == "__main__":
