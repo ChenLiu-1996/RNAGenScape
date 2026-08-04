@@ -30,10 +30,11 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from dataset import DATASET_CONFIG, DATASET_NAMES, make_dataloaders
+from analysis.metrics_io import write_metrics
 from modules.oae import DEFAULT_LATENT_DIM, OAE
 from utils.metrics import VOCAB_SIZE
 from utils.oracle import resolve_device
-from utils.results import oae_checkpoint_path
+from utils.results import oae_checkpoint_path, oae_seed_dir
 from utils.training_utils import EarlyStopping, LinearWarmupCosineAnnealingLR, seed_everything
 
 
@@ -364,7 +365,7 @@ def main() -> None:
     print(f"wrote label stats -> {stats_path}")
     print(f"wrote train meta  -> {meta_path}")
 
-    train(
+    history = train(
         model,
         train_loader,
         val_loader,
@@ -378,6 +379,8 @@ def main() -> None:
         log_path=log_path,
     )
 
+    # Metrics on the restored best checkpoint (val + test).
+    val = evaluate(model, val_loader, device=device, recon_w=args.recon_w)
     test = evaluate(model, test_loader, device=device, recon_w=args.recon_w)
     print(
         f"test loss={test['loss']:.4f} recon={test['recon']:.4f} "
@@ -386,6 +389,26 @@ def main() -> None:
         f"token_acc={test['token_acc']:.3f} seq_acc={test['seq_acc']:.3f} "
         f"selection={test['selection']:.4f}"
     )
+    metrics_path = write_metrics(
+        oae_seed_dir(
+            args.dataset,
+            args.seed,
+            latent_dim=args.latent_dim,
+            recon_w=args.recon_w,
+        ),
+        {
+            "dataset": args.dataset,
+            "model": "OAE",
+            "seed": args.seed,
+            "latent_dim": args.latent_dim,
+            "recon_w": args.recon_w,
+            "selection_metric": "0.5*(pearson+spearman)+token_acc",
+            "best_val_selection": history.get("best_val_selection"),
+            "val": val,
+            "test": test,
+        },
+    )
+    print(f"wrote metrics     -> {metrics_path}")
     print(f"checkpoint: {ckpt_path}")
 
 

@@ -1,4 +1,4 @@
-"""Train comparison baselines (DiffAb, IgLM, NOS_C, NOS_D, gg_dWJS, EM, MPGD).
+"""Train comparison baselines (DiffAb, IgLM, NOS_C, NOS_D, gg_dWJS, EM, MPGD, MFM, PCD).
 
 Example:
   python src/train_baseline.py --dataset OpenVaccine --model DiffAb --seed 1
@@ -28,14 +28,14 @@ _SRC = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from comparisons import DiffAb, EM, gg_dWJS, IgLM, MPGD, NOS_C, NOS_D
+from comparisons import DiffAb, EM, gg_dWJS, IgLM, MFM, MPGD, NOS_C, NOS_D, PCD
 from dataset import DATASET_CONFIG, DATASET_NAMES, make_dataloaders
 from utils.metrics import VOCAB_SIZE, to_token_ids
 from utils.oracle import resolve_device
 from utils.results import baseline_checkpoint_path
 from utils.training_utils import EarlyStopping, LinearWarmupCosineAnnealingLR, seed_everything
 
-BASELINE_MODELS = ("DiffAb", "IgLM", "NOS_C", "NOS_D", "gg_dWJS", "EM", "MPGD")
+BASELINE_MODELS = ("DiffAb", "IgLM", "NOS_C", "NOS_D", "gg_dWJS", "EM", "MPGD", "MFM", "PCD")
 IGLM_SPECIAL_TOKENS = 3  # CLS, SEP, MASK
 
 # Generative term name per model (property head is always ``property_mse``).
@@ -47,6 +47,8 @@ GEN_LOSS_NAME = {
     "gg_dWJS": "denoise_mse",
     "EM": "energy_flow",
     "MPGD": "diffusion_mse",
+    "MFM": "metric_flow",
+    "PCD": "pcd_contrastive",
 }
 PROP_LOSS_NAME = "property_mse"
 
@@ -121,6 +123,26 @@ def build_model(model_name: str, *, seq_len: int, device: str) -> torch.nn.Modul
             num_properties=1,
             device=device,
         )
+    if model_name == "MFM":
+        return MFM(
+            vocab_size=VOCAB_SIZE,
+            seq_len=seq_len,
+            hidden_dim=128,
+            num_layers=2,
+            num_heads=4,
+            num_properties=1,
+            device=device,
+        )
+    if model_name == "PCD":
+        return PCD(
+            vocab_size=VOCAB_SIZE,
+            seq_len=seq_len,
+            hidden_dim=256,
+            n_gibbs=5,
+            buffer_size=256,
+            num_properties=1,
+            device=device,
+        )
     raise ValueError(f"Unknown baseline model '{model_name}'. Choose from {BASELINE_MODELS}.")
 
 
@@ -153,7 +175,7 @@ def _batch_loss(
         total = recon_w * recon + property_w * prop
         return total, recon, prop, y_hat.view(-1)
 
-    if model_name in ("NOS_C", "NOS_D", "gg_dWJS", "EM", "MPGD"):
+    if model_name in ("NOS_C", "NOS_D", "gg_dWJS", "EM", "MPGD", "MFM", "PCD"):
         total, recon, prop, y_hat = model.compute_loss(
             token_ids,
             targets=targets.unsqueeze(-1),
@@ -345,9 +367,7 @@ def train(
 
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="Train DiffAb / IgLM / NOS_C / NOS_D / gg_dWJS / EM / MPGD baselines."
-    )
+    p = argparse.ArgumentParser(description="Train DiffAb / IgLM / NOS_C / NOS_D / gg_dWJS / EM / MPGD / MFM / PCD baselines.")
     p.add_argument("--dataset", type=str, required=True, choices=sorted(DATASET_NAMES))
     p.add_argument("--model", type=str, required=True, choices=list(BASELINE_MODELS))
     p.add_argument("--batch_size", type=int, default=128)

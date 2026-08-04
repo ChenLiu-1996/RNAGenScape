@@ -19,13 +19,43 @@ minibatch OT uses ``scipy.optimize.linear_sum_assignment``; CD is optional
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple, Union
+from contextlib import contextmanager
+from typing import Iterator, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
+
+
+@contextmanager
+def _math_sdp() -> Iterator[None]:
+    """Force math SDPA (needed for create_graph through Transformer attention)."""
+    cm = None
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        cm = sdpa_kernel(SDPBackend.MATH)
+    except Exception:
+        cm = None
+    if cm is not None:
+        with cm:
+            yield
+        return
+    # Fallback for older PyTorch: flip CUDA SDP backend flags.
+    flash = torch.backends.cuda.flash_sdp_enabled()
+    mem = torch.backends.cuda.mem_efficient_sdp_enabled()
+    math_on = torch.backends.cuda.math_sdp_enabled()
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+    try:
+        yield
+    finally:
+        torch.backends.cuda.enable_flash_sdp(flash)
+        torch.backends.cuda.enable_mem_efficient_sdp(mem)
+        torch.backends.cuda.enable_math_sdp(math_on)
 
 
 class EM(nn.Module):
@@ -155,13 +185,15 @@ class EM(nn.Module):
     ) -> torch.Tensor:
         """``-∇_x V(x)`` with the same shape as ``x``."""
         x_req = x if x.requires_grad else x.detach().requires_grad_(True)
-        v = self.potential(x_req, t=t, pad_mask=pad_mask)
-        grad = torch.autograd.grad(
-            outputs=v.sum(),
-            inputs=x_req,
-            create_graph=True,
-            retain_graph=True,
-        )[0]
+        # Fused SDPA backward has no higher-order grads; math SDPA does.
+        with _math_sdp():
+            v = self.potential(x_req, t=t, pad_mask=pad_mask)
+            grad = torch.autograd.grad(
+                outputs=v.sum(),
+                inputs=x_req,
+                create_graph=True,
+                retain_graph=True,
+            )[0]
         return -grad
 
     def predict_property(
