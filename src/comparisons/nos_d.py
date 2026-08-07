@@ -6,16 +6,13 @@ from typing import Optional, Union, Dict, Any
 
 
 class NOS_D(nn.Module):
-    """RNA discrete (mask-token) NOS baseline (NOS-D).
+    """NOS-D guides discrete masked diffusion sampling with property gradients.
 
-    Official NOS ([ngruver/NOS](https://github.com/ngruver/NOS)) also supports
-    discrete MLM-style corruption (``model=mlm``) with the same hidden-state
-    guidance interface. This RNA baseline masks tokens at rate ``t/T``, predicts
-    originals with CE on corrupted sites, and applies property-gradient guidance
-    in embedding space before rematerializing tokens. Vocabulary:
-    PAD/A/G/C/T/U/N/[MASK].
+    Originally discrete masked guided diffusion for protein design. This RNA adaptation applies the
+    approach to nucleotide sequences.
 
-    Paper: Protein Design with Guided Discrete Diffusion (NeurIPS 2023).
+    Paper: Protein Design with Guided Discrete Diffusion (NeurIPS 2023)
+    Github: https://github.com/ngruver/NOS
     """
 
     def __init__(
@@ -247,16 +244,11 @@ class NOS_D(nn.Module):
         if guidance_kwargs is None:
             guidance_kwargs = {}
 
-        # Start from random tokens (avoid PAD token)
-        #x = torch.randint(1, self.vocab_size, (batch_size, self.seq_len), device=self.device)
         # Start from mask tokens
         x = torch.full((batch_size, self.seq_len), self.mask_id, device=self.device)
 
         # Denoising loop
         for i in reversed(range(num_steps)):
-            # print(f"Denoising step {i} of {num_steps}")
-            # print(f"x: {self.ids_to_sequence(x)}")
-
             t = torch.full((batch_size,), i * (self.max_timesteps // num_steps),
                           device=self.device, dtype=torch.long)
 
@@ -410,18 +402,22 @@ class NOS_D(nn.Module):
         stability_coef=5.0,
         target_abs=1.0,
         mask=None,
-        corrupt_frac=0.5,
         use_reveal_schedule=True,
     ):
-        """Guided discrete diffusion starting from seed sequences ``[B, L]``."""
+        """Property-guided NOS-D sampling starting from all-MASK tokens.
+
+        ``sequences`` only sets batch size (and optional ``mask`` shape fallback).
+        """
         sequences = sequences.to(self.device)
         if sequences.dim() == 1:
             sequences = sequences.unsqueeze(0)
-        batch_size = sequences.shape[0]
+        batch_size, seq_len = sequences.shape
         if mask is None:
-            mask = (sequences != 0)
+            mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=self.device)
         else:
             mask = mask.to(self.device)
+            if mask.dtype != torch.bool:
+                mask = mask.bool()
 
         target = float(target_abs) if target_direction == "increase" else -float(target_abs)
         guidance_kwargs = {
@@ -429,26 +425,13 @@ class NOS_D(nn.Module):
             "stability_coef": float(stability_coef),
             "target_values": [target],
         }
-
-        # Partially mask seed tokens, then reverse with property guidance.
-        x = sequences.clone()
-        valid = mask.bool() & (x != 0)
-        drop = (torch.rand_like(x.float()) < float(corrupt_frac)) & valid
-        x = x.clone()
-        x[drop] = self.mask_id
-
-        steps = max(int(num_steps), 1)
-        for i in reversed(range(steps)):
-            t = torch.full(
-                (batch_size,),
-                i * (self.max_timesteps // steps),
-                device=self.device,
-                dtype=torch.long,
-            )
-            x = self._guided_step(
-                x, t, guidance_kwargs, mask, use_reveal_schedule=use_reveal_schedule
-            )
-        return x
+        return self.sample(
+            batch_size,
+            num_steps=num_steps,
+            guidance_kwargs=guidance_kwargs,
+            mask=mask,
+            use_reveal_schedule=use_reveal_schedule,
+        )
 
     def generate_sequences(self, batch_size, num_steps=50, guidance_kwargs=None, mask=None, use_reveal_schedule=False):
         """

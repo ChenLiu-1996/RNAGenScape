@@ -48,6 +48,28 @@ Source: [a96123155/UTR-LM](https://github.com/a96123155/UTR-LM/tree/main/Model/P
 
 ---
 
+## RhoFold (optional folding confidence)
+
+pLDDT evaluation uses the public [ml4bio/RhoFold](https://github.com/ml4bio/RhoFold) code and [Hugging Face weights](https://huggingface.co/cuhkaih/rhofold). Nothing under lab-private GPFS is required.
+
+```bash
+# One-time setup (clones into external_src/, downloads checkpoint, installs Bio/etc.)
+bash bash/setup_rhofold.sh
+# Or: uv sync --extra rhofold
+
+# Or let eval auto-download the checkpoint once the source tree exists:
+python src/evaluation/eval_rhofold.py --dataset OpenVaccine --model DiffAb --experiment pos_guided
+```
+
+Defaults:
+
+- Code: `external_src/RhoFold`
+- Weights: `external_src/RhoFold_pretrained/RhoFold_pretrained.pt`
+
+Override with `RHOFOLD_DIR` / `RHOFOLD_CKPT` or `--rhofold_dir` / `--ckpt` if you already have a local install.
+
+---
+
 ## Data
 
 Datasets live under `data/` (gitignored; present on disk after setup).

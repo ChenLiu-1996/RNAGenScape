@@ -5,17 +5,15 @@ import torch.nn.functional as F
 
 
 class DiffAb(nn.Module):
-    """RNA sequence diffusion baseline inspired by DiffAb.
+    """DiffAb designs sequences by iterative denoising under property guidance.
 
-    Official DiffAb ([luost26/diffab](https://github.com/luost26/diffab)) jointly
-    generates antibody CDR sequence *and* 3D structure conditioned on antigen
-    geometry (SE(3)-equivariant diffusion). This RNA baseline keeps only the
-    high-level recipe of discrete diffusion + property-aware candidate
-    selection, operating on nucleotide token sequences with a plain Transformer
-    (no coordinates, antigen context, or true equivariance).
+    Originally developed for antigen-conditioned antibody CDR (and structure) design. This RNA
+    adaptation applies guided discrete diffusion and property-aware candidate selection to
+    nucleotide sequences.
 
-    Paper: Antigen-Specific Antibody Design and Optimization with
-    Diffusion-Based Generative Models for Protein Structures (NeurIPS 2022).
+    Paper: Antigen-Specific Antibody Design and Optimization with Diffusion-Based Generative Models for
+    Protein Structures (NeurIPS 2022)
+    Github: https://github.com/luost26/diffab
     """
     def __init__(self,
                  vocab_size=4,
@@ -23,7 +21,7 @@ class DiffAb(nn.Module):
                  num_layers=2,
                  num_heads=4,
                  seq_len=124,
-                 num_timesteps=1000,
+                 num_timesteps=100,
                  dropout=0.1,
                  num_properties: int = 1,
                  device='cuda' if torch.cuda.is_available() else 'cpu'):
@@ -116,10 +114,11 @@ class DiffAb(nn.Module):
             x_0 = x_0.unsqueeze(0)
         batch_size, seq_len = x_0.shape
 
+        t = t.to(device=self.alpha_bars.device, dtype=torch.long)
         alpha_bar_t = self.alpha_bars[t].unsqueeze(1)
         noise_prob = 1 - alpha_bar_t
 
-        noise_mask = torch.rand(batch_size, seq_len, device=x_0.device) < noise_prob
+        noise_mask = torch.rand(batch_size, seq_len, device=x_0.device) < noise_prob.to(x_0.device)
         noise_tokens = torch.randint(0, self.vocab_size, (batch_size, seq_len), device=x_0.device)
         x_t = torch.where(noise_mask, noise_tokens, x_0)
 
@@ -130,9 +129,16 @@ class DiffAb(nn.Module):
 
         if t.dim() == 0:
             t = t.unsqueeze(0).expand(batch_size)
+        t = t.to(device=self.alpha_bars.device, dtype=torch.long)
 
         alpha_bar_t = self.alpha_bars[t].unsqueeze(1).unsqueeze(2)
-        alpha_bar_t_prev = torch.where(t > 0, self.alpha_bars[t-1], torch.ones_like(self.alpha_bars[0])).unsqueeze(1).unsqueeze(2)
+        alpha_bar_t_prev = torch.where(
+            t > 0,
+            self.alpha_bars[(t - 1).clamp(min=0)],
+            torch.ones_like(self.alpha_bars[0]),
+        ).unsqueeze(1).unsqueeze(2)
+        alpha_bar_t = alpha_bar_t.to(x_t.device)
+        alpha_bar_t_prev = alpha_bar_t_prev.to(x_t.device)
 
         x_t_onehot = F.one_hot(x_t, self.vocab_size).float()
 
@@ -190,7 +196,7 @@ class DiffAb(nn.Module):
         return losses, pred_properties
 
     @torch.no_grad()
-    def sample(self, shape, device, num_steps=10, mask=None, condition=None):
+    def sample(self, shape, device, num_steps=100, mask=None, condition=None):
         '''Unconditional generation.'''
         batch_size, seq_len = shape
 
@@ -208,19 +214,23 @@ class DiffAb(nn.Module):
 
     @torch.no_grad()
     def optimize(self, sequences, device, target_direction="increase",
-                 num_candidates=10, forward_steps=10, mask=None, verbose=False):
+                 num_candidates=1, forward_steps=100, mask=None, verbose=False):
         '''Optimization starting from a sequence.'''
         if len(sequences.shape) == 1:
             sequences = sequences.unsqueeze(0)
 
         batch_size, seq_len = sequences.shape
         sequences = sequences.to(device)
-        t_start = torch.full((batch_size,), forward_steps, device=device)
+        # Clamp into the trained schedule (valid indices are 0 .. num_timesteps-1).
+        t_start_idx = min(int(forward_steps), self.num_timesteps - 1)
+        t_start = torch.full((batch_size,), t_start_idx, device=device)
         x_noisy, _ = self.add_noise(sequences, t_start)
 
         traj = [x_noisy]
+        step_scale = max(self.num_timesteps // max(forward_steps, 1), 1)
         for i in reversed(range(forward_steps)):
-            t_tensor = torch.full((batch_size,), i * (self.num_timesteps // forward_steps), dtype=torch.long, device=device)
+            t_idx = min(i * step_scale, self.num_timesteps - 1)
+            t_tensor = torch.full((batch_size,), t_idx, dtype=torch.long, device=device)
 
             candidates_list = []
             for _ in range(num_candidates):

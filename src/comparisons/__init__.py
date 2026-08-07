@@ -1,11 +1,6 @@
 """Comparison / baseline methods for RNAGenScape.
 
-These are RNA-adapted reimplementations inspired by the named methods
-(DiffAb, IgLM, NOS-C, NOS-D, gg-dWJS, Energy Matching, MPGD, Metric Flow Matching,
-Persistent Contrastive Divergence). They are not drop-in ports of the official
-repos; see each module docstring for intentional adaptations.
-
-Import style matches the rest of RNAGenScape: put ``src/`` on ``sys.path``, then
+Import style: put ``src/`` on ``sys.path``, then
 ``from comparisons import DiffAb`` or ``from comparisons.diffab import DiffAb``.
 """
 

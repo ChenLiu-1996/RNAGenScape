@@ -1,20 +1,3 @@
-"""RNA-adapted Manifold Preserving Guided Diffusion (MPGD).
-
-Official MPGD ([KellyYutongHe/mpgd_pytorch](https://github.com/KellyYutongHe/mpgd_pytorch/),
-ICLR 2024, arXiv:2311.16424) is a *training-free* guided sampler for pretrained
-pixel / latent diffusion models. The shortcut updates the DDIM clean-data
-estimate ``x0|t`` with a guidance gradient, optionally projecting that update
-onto the data manifold via an autoencoder (MPGD-AE / MPGD-Z), then forms
-``x_{t-1}``.
-
-This RNA baseline keeps that sampling recipe on continuous nucleotide one-hots
-(PAD/A/G/C/T/U/N). Because we do not ship a pretrained image DM + VQGAN, we
-jointly train a small Transformer denoiser, a bottleneck sequence AE (manifold
-projector), and a property head used as the guidance loss ``L`` at sample time.
-Intentional simplifications vs the official code: no DPS/FreeDoM/LDM stack,
-VQGAN, or DDIM schedule engineering; AE is a compact seq AE rather than VQGAN.
-"""
-
 from __future__ import annotations
 
 import math
@@ -26,7 +9,14 @@ import torch.nn.functional as F
 
 
 class MPGD(nn.Module):
-    """Manifold-preserving guided diffusion for RNA sequences."""
+    """MPGD guides diffusion sampling while projecting updates back onto a learned data manifold.
+
+    Originally manifold-preserving guided diffusion for pretrained image and latent diffusion models.
+    This RNA adaptation applies the approach to nucleotide sequences.
+
+    Paper: Manifold Preserving Guided Diffusion (ICLR 2024)
+    Github: https://github.com/KellyYutongHe/mpgd_pytorch
+    """
 
     def __init__(
         self,
@@ -281,24 +271,19 @@ class MPGD(nn.Module):
         return_traj: bool = False,
     ):
         """MPGD shortcut sampling (Algorithm 1 + optional MPGD-AE)."""
+        # Official MPGD Algorithm 1: x_T ~ N(0, I), then denoise t = T .. 1.
+        # Seeds (if provided) only set batch size / length / pad mask — not the start state.
         if seed_tokens is None:
-            x = torch.randn(batch_size, self.seq_len, self.vocab_size, device=self.device)
+            seq_len = self.seq_len
             if pad_mask is None:
-                pad_mask = torch.ones(batch_size, self.seq_len, dtype=torch.bool, device=self.device)
+                pad_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=self.device)
         else:
             seed_tokens = seed_tokens.to(self.device)
             batch_size = seed_tokens.shape[0]
-            x0 = self._tokens_to_continuous(seed_tokens, self.vocab_size)
-            # Start from moderately noised seed (local refinement / optimization).
-            t0 = torch.full(
-                (batch_size,),
-                max(self.num_timesteps // 2, 1),
-                device=self.device,
-                dtype=torch.long,
-            )
-            x, _ = self.add_noise(x0, t0)
+            seq_len = seed_tokens.shape[1]
             if pad_mask is None:
                 pad_mask = seed_tokens != 0
+        x = torch.randn(batch_size, seq_len, self.vocab_size, device=self.device)
 
         steps = max(int(num_steps), 1)
         # Uniform DDIM-like timestep grid.
@@ -357,7 +342,7 @@ class MPGD(nn.Module):
         use_ae_proj: bool = True,
         pad_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Property-guided MPGD starting from seed sequences ``[B, L]``."""
+        """Property-guided MPGD from pure noise (Algorithm 1); seeds set length/mask only."""
         direction = 1.0 if target_direction == "increase" else -1.0
         return self.sample(
             batch_size=sequences.shape[0],

@@ -42,7 +42,7 @@ IGLM_SPECIAL_TOKENS = 3  # CLS, SEP, MASK
 GEN_LOSS_NAME = {
     "DiffAb": "diffusion_kl",
     "IgLM": "infill_lm",
-    "NOS_C": "noise_mse",
+    "NOS_C": "token_ce",
     "NOS_D": "masked_ce",
     "gg_dWJS": "denoise_mse",
     "EM": "energy_flow",
@@ -186,7 +186,7 @@ def _batch_loss(
 
     if model_name == "IgLM":
         seq_len = token_ids.shape[1]
-        # Random contiguous span up to 15% of length (matches mRNA-translation trainer).
+        # Random contiguous span up to 15% of length.
         mask_start = int(np.random.randint(0, max(seq_len, 1)))
         mask_len = int(np.random.randint(1, max(2, int(seq_len * 0.15) + 1)))
         mask_end = min(mask_start + mask_len, max(seq_len - 1, 1))

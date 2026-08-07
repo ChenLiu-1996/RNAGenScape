@@ -6,17 +6,13 @@ import numpy as np
 from einops import rearrange
 
 class IgLM(nn.Module):
-    """RNA infilling LM baseline inspired by IgLM.
+    """IgLM optimizes sequences by infilling masked spans and selecting property-favored candidates.
 
-    Official IgLM ([Graylab/IgLM](https://github.com/Graylab/IgLM)) is a
-    pretrained GPT-2 over antibody amino-acid sequences with chain/species
-    conditioning tokens, span infilling, and nucleus sampling. This RNA baseline
-    uses a freshly initialized HuggingFace GPT-2 over the RNA + special-token
-    vocabulary (PAD/A/G/C/T/U/N/CLS/SEP/MASK), without antibody pretrained
-    weights or chain/species tokens, plus an optional property head.
+    Originally an antibody span-infilling language model. This RNA adaptation uses infilling-based
+    candidate selection on nucleotide sequences.
 
-    Paper: IgLM: Infilling language modeling for antibody sequence design
-    (Cell Systems 2023).
+    Paper: IgLM: Infilling language modeling for antibody sequence design (Cell Systems 2023)
+    Github: https://github.com/Graylab/IgLM
     """
     def __init__(self,
                  vocab_size=10,

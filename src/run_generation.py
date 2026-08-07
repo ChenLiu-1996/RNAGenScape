@@ -14,7 +14,7 @@ Examples:
   python src/run_generation.py \\
     --dataset OpenVaccine --method guided --model DiffAb \\
     --experiment pos_guided --seed 1 --direction 1 \\
-    --num_steps 10 --forward_steps 10 --num_candidates 10
+    --num_steps 10 --forward_steps 100 --num_candidates 1
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from modules.manifold_projector_dae import load_manifold_projector_dae
 from modules.manifold_projector_knn import ManifoldProjectorKNN
 from modules.oae import OAE, load_oae
 from train_baseline import BASELINE_MODELS, build_model
-from utils.metrics import VOCAB_SIZE, to_token_ids
+from utils.metrics import VOCAB_SIZE, subsample_indices, to_token_ids
 from utils.oracle import resolve_device
 from utils.results import (
     baseline_checkpoint_path,
@@ -50,6 +50,11 @@ from utils.results import (
     normalize_latent_norm_name,
     oae_checkpoint_path,
     save_generation_artifact,
+)
+from utils.starts_cache import (
+    load_starts_cache,
+    save_starts_cache,
+    starts_content_hash,
 )
 from utils.training_utils import seed_everything
 
@@ -64,7 +69,6 @@ DEFAULT_DAE_HIDDEN_DIMS = (32, 16, 32)
 
 def direction_to_target(direction: float) -> str:
     return "increase" if float(direction) > 0 else "decrease"
-
 
 def pad_mask(token_ids: torch.Tensor) -> torch.Tensor:
     return token_ids != 0
@@ -82,21 +86,6 @@ def collect_tokens_and_labels(loader, *, device: str) -> Tuple[torch.Tensor, tor
     return torch.cat(tokens, dim=0), torch.cat(labels, dim=0)
 
 
-def subsample_token_starts(
-    pool_x: torch.Tensor,
-    pool_y: torch.Tensor,
-    *,
-    subsample_seed: int,
-) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray]:
-    """Same 25%/all rule as RNAGenScape start pooling."""
-    n = pool_x.shape[0]
-    sample_size = int(n * 0.25) if n >= 20000 else n
-    rng = np.random.default_rng(seed=subsample_seed)
-    indices = rng.choice(n, size=sample_size, replace=False)
-    indices_t = torch.from_numpy(indices.astype(np.int64))
-    return pool_x[indices_t], pool_y[indices_t], indices
-
-
 def load_json_label_stats(path: str) -> Dict[str, float]:
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Missing label stats: {path}")
@@ -108,6 +97,44 @@ def load_json_label_stats(path: str) -> Dict[str, float]:
         "label_min": float(raw["label_min"]),
         "label_max": float(raw["label_max"]),
     }
+
+
+def resolve_start_indices(
+    pool_size: int,
+    *,
+    max_starts: int,
+    subsample_seed: int,
+    starts_cache: str | None,
+) -> Tuple[np.ndarray, bool]:
+    """Return ``(indices, from_cache)`` for start-pool selection."""
+    cache_path = (starts_cache or "").strip()
+    if cache_path and os.path.isfile(cache_path):
+        _sampled_x, _sampled_y, sampled_indices = load_starts_cache(cache_path)
+        indices = np.asarray(sampled_indices, dtype=np.int64).reshape(-1)
+        if indices.size == 0:
+            raise ValueError(f"Empty starts cache: {cache_path}")
+        if int(indices.max()) >= pool_size or int(indices.min()) < 0:
+            raise ValueError(
+                f"Starts cache indices out of range for pool_size={pool_size}: {cache_path}"
+            )
+        return indices, True
+    seed_everything(subsample_seed)
+    return subsample_indices(pool_size, max_starts, subsample_seed), False
+
+
+def maybe_save_starts_cache(
+    starts_cache: str | None,
+    *,
+    sampled_x: torch.Tensor,
+    sampled_y: torch.Tensor,
+    sampled_indices: np.ndarray,
+    from_cache: bool,
+) -> None:
+    cache_path = (starts_cache or "").strip()
+    if (not cache_path) or from_cache:
+        return
+    save_starts_cache(cache_path, sampled_x, sampled_y, sampled_indices)
+    print(f"wrote starts_cache={cache_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -255,31 +282,7 @@ def decode_latents(
     return torch.cat(outs, dim=0)
 
 
-def subsample_starts(
-    pool_latent: torch.Tensor,
-    pool_y: torch.Tensor,
-    pool_x: torch.Tensor,
-    *,
-    subsample_seed: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]:
-    n = pool_latent.shape[0]
-    sample_size = int(n * 0.25) if n >= 20000 else n
-    rng = np.random.default_rng(seed=subsample_seed)
-    indices = rng.choice(n, size=sample_size, replace=False)
-    indices_t = torch.from_numpy(indices.astype(np.int64))
-    return (
-        pool_latent[indices_t],
-        pool_y[indices_t],
-        pool_x[indices_t],
-        indices,
-    )
-
-
 def run_rnagenscape(args, device: str) -> str:
-    if args.sugar_w > 0.0:
-        raise NotImplementedError(
-            "SUGAR augmentation is not ported yet. Use --sugar_w 0.0 for now."
-        )
     if args.model != "OAE":
         raise ValueError("method=rnagenscape currently requires --model OAE")
 
@@ -325,13 +328,28 @@ def run_rnagenscape(args, device: str) -> str:
         pool_latent, mode=args.latent_normalization, stats=latent_stats
     )
 
-    seed_everything(args.subsample_seed)
-    sampled_latent, sampled_y, sampled_x, sampled_indices = subsample_starts(
-        pool_latent, pool_y, pool_x, subsample_seed=args.subsample_seed
+    indices, from_cache = resolve_start_indices(
+        pool_latent.shape[0],
+        max_starts=args.max_starts,
+        subsample_seed=args.subsample_seed,
+        starts_cache=args.starts_cache,
+    )
+    indices_t = torch.from_numpy(indices.astype(np.int64))
+    sampled_latent = pool_latent[indices_t]
+    sampled_y = pool_y[indices_t]
+    sampled_x = pool_x[indices_t]
+    sampled_indices = indices
+    maybe_save_starts_cache(
+        args.starts_cache,
+        sampled_x=sampled_x,
+        sampled_y=sampled_y,
+        sampled_indices=sampled_indices,
+        from_cache=from_cache,
     )
     print(
-        f"start pool={pool_latent.shape[0]} starts={sampled_latent.shape[0]} "
-        f"subsample_seed={args.subsample_seed}"
+        f"starts_hash={starts_content_hash(sampled_x)} n_starts={sampled_x.shape[0]} "
+        f"from_cache={from_cache} start_pool={pool_latent.shape[0]} "
+        f"max_starts={args.max_starts} subsample_seed={args.subsample_seed}"
     )
 
     projector = load_projector(
@@ -420,6 +438,7 @@ def run_rnagenscape(args, device: str) -> str:
             "latent_normalization": normalize_latent_norm_name(args.latent_normalization),
             "oae_latent_dim": int(args.latent_dim),
             "oae_recon_w": float(args.recon_w),
+            "max_starts": int(args.max_starts),
         },
     )
     print(f"wrote {path}")
@@ -442,6 +461,9 @@ def load_baseline_model(model_name: str, *, dataset: str, seed: int, device: str
     model = build_model(model_name, seq_len=seq_len, device=device)
     state = torch.load(ckpt, map_location=device)
     model.load_state_dict(state)
+    model.to(device)
+    if hasattr(model, "device"):
+        model.device = torch.device(device)
     model.eval()
     return model
 
@@ -497,7 +519,6 @@ def optimize_baseline_batch(
             step_size=args.step_size,
             stability_coef=args.stability_coef,
             target_abs=abs(float(args.direction)),
-            mask=mask.float(),
         ).detach().cpu()
 
     if model_name == "NOS_D":
@@ -508,7 +529,6 @@ def optimize_baseline_batch(
             step_size=args.step_size,
             stability_coef=args.stability_coef,
             target_abs=abs(float(args.direction)),
-            mask=mask,
             use_reveal_schedule=True,
         ).detach().cpu()
 
@@ -586,13 +606,27 @@ def run_guided(args, device: str) -> str:
     )
 
     pool_x, pool_y = collect_tokens_and_labels(test_loader, device=device)
-    seed_everything(args.subsample_seed)
-    sampled_x, sampled_y, sampled_indices = subsample_token_starts(
-        pool_x, pool_y, subsample_seed=args.subsample_seed
+    indices, from_cache = resolve_start_indices(
+        pool_x.shape[0],
+        max_starts=args.max_starts,
+        subsample_seed=args.subsample_seed,
+        starts_cache=args.starts_cache,
+    )
+    indices_t = torch.from_numpy(indices.astype(np.int64))
+    sampled_x = pool_x[indices_t]
+    sampled_y = pool_y[indices_t]
+    sampled_indices = indices
+    maybe_save_starts_cache(
+        args.starts_cache,
+        sampled_x=sampled_x,
+        sampled_y=sampled_y,
+        sampled_indices=sampled_indices,
+        from_cache=from_cache,
     )
     print(
-        f"start pool={pool_x.shape[0]} starts={sampled_x.shape[0]} "
-        f"subsample_seed={args.subsample_seed}"
+        f"starts_hash={starts_content_hash(sampled_x)} n_starts={sampled_x.shape[0]} "
+        f"from_cache={from_cache} start_pool={pool_x.shape[0]} "
+        f"max_starts={args.max_starts} subsample_seed={args.subsample_seed}"
     )
 
     seed_everything(args.seed)
@@ -636,6 +670,7 @@ def run_guided(args, device: str) -> str:
             "num_candidates": int(args.num_candidates),
             "forward_steps": int(args.forward_steps),
             "stability_coef": float(args.stability_coef),
+            "max_starts": int(args.max_starts),
         },
     )
     print(f"wrote {path}")
@@ -662,6 +697,18 @@ def parse_args():
     p.add_argument("--experiment", type=str, required=True, help="Experiment id (no seed).")
     p.add_argument("--seed", type=int, default=1, help="Training seed; loads checkpoint under seed_{seed}/.")
     p.add_argument("--subsample_seed", type=int, default=42, help="RNG for start-pool subsample.")
+    p.add_argument(
+        "--max_starts",
+        type=int,
+        default=1000,
+        help="Max number of start sequences sampled from the test pool.",
+    )
+    p.add_argument(
+        "--starts_cache",
+        type=str,
+        default="",
+        help="Optional .pt path: load shared starts if present, else sample and save.",
+    )
     p.add_argument("--direction", type=float, default=1.0, help="+1 maximize / -1 minimize property.")
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--num_workers", type=int, default=0)
@@ -690,9 +737,9 @@ def parse_args():
     p.add_argument("--save_trajectories", action="store_true", default=False)
 
     # Baseline guided optimization
-    p.add_argument("--num_candidates", type=int, default=10, help="DiffAb / IgLM candidate count.")
-    p.add_argument("--forward_steps", type=int, default=10, help="DiffAb forward-noise steps.")
-    p.add_argument("--stability_coef", type=float, default=5.0, help="NOS guidance stability coef.")
+    p.add_argument("--num_candidates", type=int, default=1, help="DiffAb / IgLM candidate count.")
+    p.add_argument("--forward_steps", type=int, default=100, help="DiffAb forward-noise steps.")
+    p.add_argument("--stability_coef", type=float, default=1.0, help="NOS guidance stability coef.")
     p.add_argument("--guide_scale", type=float, default=1.0, help="Property guidance scale (EM/MPGD/gg_dWJS/PCD).")
     p.add_argument("--t_end", type=float, default=1.0, help="EM sampling end time.")
     p.add_argument("--dt", type=float, default=0.01, help="EM Euler-Maruyama step.")

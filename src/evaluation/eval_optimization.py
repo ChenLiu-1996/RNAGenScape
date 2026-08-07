@@ -58,6 +58,7 @@ def evaluate_one_seed(
     *,
     seed: int,
     run_dir: str,
+    exp_dir: str,
     oracle_model,
     oracle_name: str,
     dataset: str,
@@ -107,12 +108,27 @@ def evaluate_one_seed(
         direction=direction,
         seed=seed,
     )
+    row.update(_load_rhofold_plddt_means(exp_dir, seed))
     row["seed"] = seed
     row["run_dir"] = run_dir
     row["dataset"] = dataset
     row["oracle"] = oracle_name
     row["direction"] = direction
     return row
+
+
+def _load_rhofold_plddt_means(exp_dir: str, seed: int) -> dict:
+    """Attach RhoFold mean pLDDT if ``evaluation/rhofold/seed_*/rhofold_plddt.npz`` exists."""
+    npz_path = os.path.join(
+        evaluation_dir(exp_dir), "rhofold", f"seed_{seed}", "rhofold_plddt.npz"
+    )
+    if not os.path.isfile(npz_path):
+        return {}
+    data = np.load(npz_path, allow_pickle=True)
+    return {
+        "generated_mean_plddt": float(np.mean(np.asarray(data["gen_mean_plddt"], dtype=np.float64))),
+        "root_mean_plddt": float(np.mean(np.asarray(data["start_mean_plddt"], dtype=np.float64))),
+    }
 
 
 def main():
@@ -152,6 +168,7 @@ def main():
         row = evaluate_one_seed(
             seed=seed,
             run_dir=run_dir,
+            exp_dir=exp_dir,
             oracle_model=oracle_model,
             oracle_name=args.oracle,
             dataset=args.dataset,

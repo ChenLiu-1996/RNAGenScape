@@ -14,14 +14,12 @@ Design (single vector ``z in R^D``)::
       -> token logits [B,L,V]
 
 Why AdaptiveAvgPool (not GAP, not AttentionPool):
-* GAP collapses L' to one mean and drops position. Property heads thrive on
-  composition alone, so pearson/spearman rise fast while token_acc stalls
-  (exactly the ZF failure mode).
+* GAP collapses L' to one mean and drops position. Property heads can then
+  fit composition alone, so correlation metrics rise while token_acc stalls.
 * AttentionPool can re-learn a soft GAP (queries attend globally) and still
   under-serve base-level recon.
 * AdaptiveAvgPool1d(K) forces K equal-length positional bins. Position reaches
   z by construction; D remains the only Langevin capacity bottleneck.
-  This matches the old OrganizedAE recipe that reached ZF tok ~0.6-0.67.
 
 Defaults: base_channels=64, num_down=2, pool_tokens=16
   (C=256, path approximately 64@L -> 128@L/2 -> 256@L/4 -> AdaptPool(16)).

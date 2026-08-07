@@ -1,24 +1,3 @@
-"""RNA-adapted Energy Matching (EM) baseline.
-
-Official Energy Matching (m1balcerak/EnergyMatching, NeurIPS 2025, arXiv:2504.10612)
-learns a time-independent scalar potential V_theta(x) whose negative gradient
--grad_x V transports noise to data (OT / flow matching), while contrastive
-divergence near the data shapes V into an unnormalized log-likelihood (EBM).
-Protein inverse design in the official repo runs EM in a pretrained VAE latent
-with a separate fitness CNN for guided sampling.
-
-This RNA baseline keeps the EM training/sampling recipe on continuous nucleotide
-one-hots (PAD/A/G/C/T/U/N), with a small Transformer potential + joint property
-head (matching our other comparison trainers). Intentional RNA adaptations vs
-official proteins code: no VAE / UNet1D / torchcfm / multi-GPU CD warm-up;
-minibatch OT via scipy.optimize.linear_sum_assignment; CD optional
-(lambda_cd, default 0 = flow-only warm-up, matching official Algorithm 1).
-
-Velocity / CD / SDE updates follow experiments/proteins/model_proteins.py and
-utils_train_proteins.py (enable_grad + create_graph for -grad V; MALA gibbs;
-Euler-Maruyama with piecewise epsilon(t)).
-"""
-
 from __future__ import annotations
 
 import math
@@ -32,35 +11,16 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 
-@contextmanager
-def _math_sdp() -> Iterator[None]:
-    """Force math-only SDPA (same intent as official sdp_kernel flash/mem off)."""
-    cm = None
-    try:
-        from torch.nn.attention import SDPBackend, sdpa_kernel
-
-        cm = sdpa_kernel(SDPBackend.MATH)
-    except Exception:
-        cm = None
-    if cm is not None:
-        with cm:
-            yield
-        return
-    try:
-        with torch.backends.cuda.sdp_kernel(
-            enable_flash=False,
-            enable_mem_efficient=False,
-            enable_math=True,
-        ):
-            yield
-        return
-    except Exception:
-        pass
-    yield
-
-
 class EM(nn.Module):
-    """Energy Matching for RNA sequences (scalar potential + property head)."""
+    """Energy Matching unifies flow matching and energy-based modeling for generation and inverse design.
+
+    Originally a general generative framework that learns a scalar energy whose gradient transports
+    noise to data. This RNA adaptation applies Energy Matching to nucleotide sequences with property
+    guidance.
+
+    Paper: Energy Matching: Unifying Flow Matching and Energy-Based Models for Generative Modeling (NeurIPS 2025)
+    Github: https://github.com/m1balcerak/EnergyMatching
+    """
 
     def __init__(
         self,
@@ -466,6 +426,33 @@ class EM(nn.Module):
             pad_mask=pad_mask,
             return_traj=False,
         )
+
+
+@contextmanager
+def _math_sdp() -> Iterator[None]:
+    """Force math-only SDPA (disable flash / mem-efficient kernels)."""
+    cm = None
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        cm = sdpa_kernel(SDPBackend.MATH)
+    except Exception:
+        cm = None
+    if cm is not None:
+        with cm:
+            yield
+        return
+    try:
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=False,
+            enable_mem_efficient=False,
+            enable_math=True,
+        ):
+            yield
+        return
+    except Exception:
+        pass
+    yield
 
 
 class _SinusoidalPositionalEncoding(nn.Module):

@@ -27,6 +27,16 @@ dependencies = [
     "xformers>=0.0.31.post1",
 ]
 
+# Optional RhoFold pLDDT eval (public ml4bio/RhoFold code under external_src/).
+# Install with: uv sync --extra rhofold
+[project.optional-dependencies]
+rhofold = [
+    "biopython>=1.83",
+    "python-box>=7.0",
+    "dm-tree>=0.1.8",
+    "ml-collections>=0.1.1",
+]
+
 # torch-scatter is built from source on this cluster (PyG wheels need newer glibc).
 # Build only (do NOT leave GCC/12 loaded when running Python - it breaks torch_scatter/ABI):
 #   module load GCC/12.2.0 CUDA/12.2.2

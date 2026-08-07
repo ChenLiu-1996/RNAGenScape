@@ -1,16 +1,3 @@
-"""RNA-adapted gradient-guided discrete Walk-Jump Sampling (gg-dWJS).
-
-Official gg-dWJS ([zarifikram/gg-dWJS](https://github.com/zarifikram/gg-dWJS))
-trains a Gaussian denoiser on continuous one-hots and a separate property
-discriminator on the smoothed manifold, then runs underdamped Langevin walk
-steps with score + property-gradient guidance, followed by a Bayes jump back
-to discrete sequences (TMLR 2024).
-
-This RNA baseline keeps that recipe with a small Transformer backbone over
-nucleotide one-hots (PAD/A/G/C/T/U/N), joint training of denoiser + property
-head (matching our other comparison trainers), and no Lightning/Hydra/ByteNet.
-"""
-
 from __future__ import annotations
 
 import math
@@ -22,7 +9,14 @@ import torch.nn.functional as F
 
 
 class gg_dWJS(nn.Module):
-    """Gradient-guided discrete Walk-Jump Sampling for RNA sequences."""
+    """gg-dWJS walks on a smoothed sequence manifold with property guidance, then jumps back to discrete sequences.
+
+    Originally developed for biological sequence (antibody/peptide) optimization via guided walk-jump
+    sampling. This RNA adaptation applies the method to nucleotide sequences.
+
+    Paper: Gradient-guided discrete walk-jump sampling for biological sequence generation (TMLR 2024)
+    Github: https://github.com/zarifikram/gg-dWJS
+    """
 
     def __init__(
         self,

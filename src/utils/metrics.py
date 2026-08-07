@@ -227,18 +227,73 @@ def select_elite_mask(
     direction: float,
     std_scale: float = 1.0,
 ) -> np.ndarray:
-    """Elite = much better than median in the optimization direction.
+    """Held-out / elite = much better than mean in the optimization direction.
 
-    A point is elite if direction * (score - median) > std_scale * std(scores).
-    For direction > 0 this is score > median + std_scale * std;
-    for direction < 0 this is score < median - std_scale * std.
+    Paper definition: select pool points with
+    ``direction * (score - mean) > std_scale * std(scores)``.
+    For direction > 0 this is score > mean + std_scale * std;
+    for direction < 0 this is score < mean - std_scale * std.
     """
     scores = np.asarray(scores, dtype=np.float64).reshape(-1)
     if scores.size == 0:
         return np.zeros(0, dtype=bool)
-    med = float(np.median(scores))
+    mean = float(np.mean(scores))
     spread = float(np.std(scores))
-    return (direction * (scores - med)) > (std_scale * spread)
+    return (direction * (scores - mean)) > (std_scale * spread)
+
+
+def heldout_distance_metrics(
+    *,
+    generated_tokens,
+    start_tokens,
+    pool_tokens,
+    pool_scores: np.ndarray,
+    direction: float,
+    std_scale: float = 1.0,
+    return_gen_nn: bool = False,
+) -> Dict[str, Any]:
+    """Distances from generated (and start) sequences to the held-out set.
+
+    Held-out set = pool points better than ``mean + direction * std``
+    (with ``std_scale`` multiplying the std term).
+    """
+    pool_scores = np.asarray(pool_scores, dtype=np.float64).reshape(-1)
+    mask = select_elite_mask(pool_scores, direction=direction, std_scale=std_scale)
+    n_heldout = int(mask.sum())
+    mean = float(np.mean(pool_scores)) if pool_scores.size else float("nan")
+    spread = float(np.std(pool_scores)) if pool_scores.size else float("nan")
+    threshold = mean + float(direction) * float(std_scale) * spread
+    out: Dict[str, Any] = {
+        "heldout_n": float(n_heldout),
+        "heldout_pool_n": float(pool_scores.size),
+        "heldout_mean": mean,
+        "heldout_std": spread,
+        "heldout_threshold": float(threshold),
+    }
+    if n_heldout == 0:
+        out["heldout_nn_hamming_gen_mean"] = float("nan")
+        out["heldout_nn_hamming_start_mean"] = float("nan")
+        out["heldout_w2_hamming"] = float("nan")
+        if return_gen_nn:
+            out["heldout_nn_hamming_gen"] = np.zeros(0, dtype=np.float64)
+        return out
+
+    pool_ids = to_token_ids(pool_tokens)
+    heldout_ids = pool_ids[mask]
+    gen_nn = nearest_hamming_distance(generated_tokens, heldout_ids)
+    start_nn = nearest_hamming_distance(start_tokens, heldout_ids)
+    out["heldout_nn_hamming_gen_mean"] = float(np.mean(gen_nn))
+    out["heldout_nn_hamming_start_mean"] = float(np.mean(start_nn))
+    out["heldout_w2_hamming"] = float(
+        wasserstein_distance(
+            to_token_ids(generated_tokens).cpu().numpy(),
+            heldout_ids.cpu().numpy(),
+            metric="hamming",
+        )
+    )
+    if return_gen_nn:
+        out["heldout_nn_hamming_gen"] = gen_nn
+    return out
 
 
 def elite_distance_metrics(
@@ -250,37 +305,24 @@ def elite_distance_metrics(
     direction: float,
     std_scale: float = 1.0,
 ) -> Dict[str, float]:
-    """Distances from generated (and start) sequences to the held-out elite set."""
-    pool_scores = np.asarray(pool_scores, dtype=np.float64).reshape(-1)
-    elite_mask = select_elite_mask(pool_scores, direction=direction, std_scale=std_scale)
-    n_elite = int(elite_mask.sum())
-    med = float(np.median(pool_scores))
-    out: Dict[str, float] = {
-        "elite_n": float(n_elite),
-        "elite_pool_n": float(pool_scores.size),
-        "elite_median": med,
-        "elite_std_scale": float(std_scale),
-    }
-    if n_elite == 0:
-        out["elite_nn_hamming_gen_mean"] = float("nan")
-        out["elite_nn_hamming_root_mean"] = float("nan")
-        out["elite_w2_hamming"] = float("nan")
-        return out
-
-    pool_ids = to_token_ids(pool_tokens)
-    elite_ids = pool_ids[elite_mask]
-    gen_nn = nearest_hamming_distance(generated_tokens, elite_ids)
-    start_nn = nearest_hamming_distance(start_tokens, elite_ids)
-    out["elite_nn_hamming_gen_mean"] = float(np.mean(gen_nn))
-    out["elite_nn_hamming_root_mean"] = float(np.mean(start_nn))
-    out["elite_w2_hamming"] = float(
-        wasserstein_distance(
-            to_token_ids(generated_tokens).cpu().numpy(),
-            elite_ids.cpu().numpy(),
-            metric="hamming",
-        )
+    """Alias of held-out distances under legacy ``elite_*`` CSV keys."""
+    held = heldout_distance_metrics(
+        generated_tokens=generated_tokens,
+        start_tokens=start_tokens,
+        pool_tokens=pool_tokens,
+        pool_scores=pool_scores,
+        direction=direction,
+        std_scale=std_scale,
     )
-    return out
+    return {
+        "elite_n": held["heldout_n"],
+        "elite_pool_n": held["heldout_pool_n"],
+        "elite_median": held["heldout_mean"],  # mean-based; key kept for CSV continuity
+        "elite_std_scale": float(std_scale),
+        "elite_nn_hamming_gen_mean": held["heldout_nn_hamming_gen_mean"],
+        "elite_nn_hamming_root_mean": held["heldout_nn_hamming_start_mean"],
+        "elite_w2_hamming": held["heldout_w2_hamming"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -473,15 +515,25 @@ def optimization_metrics(
     metrics["mean_edit_distance"] = float(np.mean(edits))
     metrics["median_edit_distance"] = float(np.median(edits))
 
+    held = heldout_distance_metrics(
+        generated_tokens=generated_tokens,
+        start_tokens=start_tokens,
+        pool_tokens=test_pool_tokens,
+        pool_scores=test_pool_scores,
+        direction=direction,
+        std_scale=elite_std_scale,
+    )
+    metrics.update(held)
     metrics.update(
-        elite_distance_metrics(
-            generated_tokens=generated_tokens,
-            start_tokens=start_tokens,
-            pool_tokens=test_pool_tokens,
-            pool_scores=test_pool_scores,
-            direction=direction,
-            std_scale=elite_std_scale,
-        )
+        {
+            "elite_n": held["heldout_n"],
+            "elite_pool_n": held["heldout_pool_n"],
+            "elite_median": held["heldout_mean"],
+            "elite_std_scale": float(elite_std_scale),
+            "elite_nn_hamming_gen_mean": held["heldout_nn_hamming_gen_mean"],
+            "elite_nn_hamming_root_mean": held["heldout_nn_hamming_start_mean"],
+            "elite_w2_hamming": held["heldout_w2_hamming"],
+        }
     )
 
     metrics.update(heuristic_summary(gen_ids, prefix="generated"))

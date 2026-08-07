@@ -13,7 +13,9 @@ Example:
 
 Requires a trained OAE at
 ``results/<dataset>/OAE/d{latent}_recon{w}/seed_{seed}/model.pt``.
-SUGAR augmentation (``sugar_w > 0``) is reserved for a later port.
+
+With ``sugar_w > 0``, train latents are augmented via SUGAR before DAE training
+or kNN caching (saved under ``..._sugar{w}/`` so configs do not collide).
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from modules.manifold_projector_dae import (
     train_manifold_projector_dae,
 )
 from modules.oae import OAE, load_oae
+from modules.sugar import augment_latents_with_sugar
 from utils.metrics import VOCAB_SIZE
 from utils.oracle import resolve_device
 from utils.results import (
@@ -119,7 +122,12 @@ def parse_args():
     p.add_argument("--projector", type=str, required=True, choices=PROJECTOR_CHOICES)
     p.add_argument("--latent_dim", type=int, default=128, help="Must match OAE folder d{latent}_recon{w}.")
     p.add_argument("--recon_w", type=float, default=5.0, help="Must match OAE folder d{latent}_recon{w}.")
-    p.add_argument("--sugar_w", type=float, default=0.0, help="SUGAR upsample weight (0 = off).")
+    p.add_argument(
+        "--sugar_w",
+        type=float,
+        default=0.0,
+        help="SUGAR upsample weight (0=off). Saves under ..._sugar{w}/.",
+    )
     p.add_argument("--latent_normalization", type=str, default="none", choices=["none", "normal", "minmax"])
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--batch_size", type=int, default=128, help="OAE encode + DAE train batch size.")
@@ -139,11 +147,6 @@ def main() -> None:
     seed_everything(args.seed)
     device = resolve_device()
     print(f"device={device}")
-
-    if args.sugar_w > 0.0:
-        raise NotImplementedError(
-            "SUGAR augmentation is not ported yet. Use --sugar_w 0.0 for now."
-        )
 
     oae = load_oae_model(
         args.dataset,
@@ -180,10 +183,18 @@ def main() -> None:
     )
     print(f"train latents: shape={tuple(latents.shape)} stats={latent_stats}")
 
+    n_before_sugar = int(latents.shape[0])
+    latents = augment_latents_with_sugar(
+        latents, args.sugar_w, seed=args.seed, max_fit_points=10000
+    )
+    n_sugar = int(latents.shape[0]) - n_before_sugar
+
     meta = {
         "dataset": args.dataset,
         "projector": args.projector,
         "sugar_w": args.sugar_w,
+        "n_before_sugar": n_before_sugar,
+        "n_sugar_added": n_sugar,
         "latent_normalization": normalize_latent_norm_name(args.latent_normalization),
         "seed": args.seed,
         "oae_latent_dim": int(args.latent_dim),

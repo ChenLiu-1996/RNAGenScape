@@ -1,25 +1,3 @@
-"""RNA-adapted Persistent Contrastive Divergence (PCD) baseline.
-
-PCD (Tieleman, ICML 2008, "Training Restricted Boltzmann Machines using
-Approximations to the Likelihood Gradient") approximates the RBM model
-expectation with a *persistent* Markov chain (fantasy particles) updated a
-few Gibbs steps each parameter update, rather than restarting CD-k from data.
-
-Baseline adaptation (RNA property optimization):
-* Visible units are flattened soft/binary nucleotide one-hots
-  (PAD/A/G/C/T/U/N) of shape ``L * V``.
-* Train a binary RBM with PCD-k on those visibles + a joint property head
-  (same trainer protocol as EM / MPGD / MFM).
-* Sampling / optimization uses Langevin dynamics on the RBM free energy
-  ``F(v)`` in continuous ``[0,1]`` / ``[-1,1]`` relaxation, optionally steered
-  by the property head (increase / decrease).
-
-Intentional simplifications vs classical RBM toolkits: no spark / CUDA-RBM
-stack; Gibbs PCD for training; Langevin (not Gibbs) for optimize/sample as
-requested; property head is an MLP on pooled continuous sequences rather
-than being folded into the RBM energy.
-"""
-
 from __future__ import annotations
 
 from typing import Optional, Tuple, Union
@@ -30,7 +8,14 @@ import torch.nn.functional as F
 
 
 class PCD(nn.Module):
-    """Persistent CD RBM for RNA sequences (+ Langevin optimize)."""
+    """PCD trains an energy-based model with persistent Markov chains and samples with property-guided dynamics.
+
+    Originally persistent contrastive divergence for energy-based / RBM training. This RNA adaptation
+    applies PCD to nucleotide sequence modeling with property-guided sampling.
+
+    Paper: Training Restricted Boltzmann Machines using Approximations to the Likelihood Gradient (ICML 2008)
+    Github: N/A
+    """
 
     def __init__(
         self,

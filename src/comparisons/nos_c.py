@@ -1,21 +1,22 @@
+from __future__ import annotations
+
 import math
+from typing import Optional, Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Union, Dict, Any
 
 
 class NOS_C(nn.Module):
-    """RNA continuous (Gaussian-embedding) NOS baseline (NOS-C).
+    """NOS-C guides continuous embedding-space diffusion with property gradients.
 
-    Official NOS ([ngruver/NOS](https://github.com/ngruver/NOS)) trains sequence
-    diffusion with Gaussian corruption in embedding space (``model=gaussian``)
-    and guides sampling via gradients w.r.t. hidden states
-    (``step_size``, ``stability_coef``). This RNA baseline mirrors that recipe
-    on nucleotide tokens (PAD/A/G/C/T/U/N), with a compact Transformer denoiser
-    and an attached property head used for guidance.
+    Originally continuous guided diffusion for protein design (Gaussian corruption /
+    transitions in token embedding space, with a categorical denoiser). This RNA
+    adaptation applies the approach to nucleotide sequences.
 
-    Paper: Protein Design with Guided Discrete Diffusion (NeurIPS 2023).
+    Paper: Protein Design with Guided Discrete Diffusion (NeurIPS 2023)
+    Github: https://github.com/ngruver/NOS
     """
 
     def __init__(
@@ -25,50 +26,41 @@ class NOS_C(nn.Module):
         num_layers: int = 2,
         num_heads: int = 8,
         dropout: float = 0.1,
-        max_timesteps: int = 1000,
-        noise_scale: float = 5.0,
+        max_timesteps: int = 100,
         num_properties: int = 1,
         device: Optional[Union[str, torch.device]] = None,
+        # Kept for API compatibility with older call sites; unused (no noise MSE).
+        noise_scale: float = 1.0,
     ):
         super().__init__()
 
         if device is None:
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         elif isinstance(device, str):
             device = torch.device(device)
         self.device = device
 
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
-        self.max_timesteps = max_timesteps
-        self.noise_scale = noise_scale
+        self.max_timesteps = int(max_timesteps)
+        self.noise_scale = float(noise_scale)  # unused; continuous schedule is unit Gaussian
         self.num_properties = num_properties
 
-        # RNA vocabulary mapping
-        self.rna_vocab = {'PAD': 0, 'A': 1, 'G': 2, 'C': 3, 'T': 4, 'U': 5, 'N': 6}
-        self.idx_to_base = {0: 'PAD', 1: 'A', 2: 'G', 3: 'C', 4: 'T', 5: 'U', 6: 'N'}
+        # Continuous path has no [MASK] token (that is NOS-D).
+        self.rna_vocab = {"PAD": 0, "A": 1, "G": 2, "C": 3, "T": 4, "U": 5, "N": 6}
+        self.idx_to_base = {0: "PAD", 1: "A", 2: "G", 3: "C", 4: "T", 5: "U", 6: "N"}
         self.vocab_size = len(self.rna_vocab)
+        self.pad_id = 0
 
-        # Token embedding
         self.token_embedding = nn.Embedding(self.vocab_size, hidden_dim)
-
-        # Positional encoding
         self.pos_encoding = PositionalEncoding(hidden_dim, seq_len + 100)
-
-        # Time embedding
         self.time_embedding = TimeEmbedding(hidden_dim)
-
-        # Transformer backbone
-        self.transformer_layers = nn.ModuleList([
-            NOSTransformerBlock(hidden_dim, num_heads, dropout)
-            for _ in range(num_layers)
-        ])
-
-        # Output layers
+        self.transformer_layers = nn.ModuleList(
+            [NOSTransformerBlock(hidden_dim, num_heads, dropout) for _ in range(num_layers)]
+        )
         self.output_norm = nn.LayerNorm(hidden_dim)
-        self.noise_pred_head = nn.Linear(hidden_dim, hidden_dim)  # Predict noise in embedding space
-
-        # Property prediction head
+        # Predict clean tokens from continuous noisy embeddings (paper §3 continuous noise).
+        self.token_pred_head = nn.Linear(hidden_dim, self.vocab_size)
         self.property_head = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.GELU(),
@@ -76,13 +68,11 @@ class NOS_C(nn.Module):
             nn.Linear(64, 32),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(32, num_properties)
+            nn.Linear(32, num_properties),
         )
-
         self._initialize_weights()
 
     def _initialize_weights(self):
-        """Initialize model weights"""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -94,310 +84,284 @@ class NOS_C(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
+    def alpha_bar(self, t: torch.Tensor) -> torch.Tensor:
+        """Linear cumulative schedule ``ᾱ_t = 1 - t / T`` in ``(eps, 1]``."""
+        T = float(max(self.max_timesteps, 1))
+        ab = 1.0 - (t.float() / T)
+        return ab.clamp(min=1e-4, max=1.0)
+
     def sequence_to_ids(self, sequences):
-        """Convert RNA sequences to token IDs"""
         if isinstance(sequences, str):
             sequences = [sequences]
-
         batch_ids = []
         for seq in sequences:
-            ids = [self.rna_vocab.get(base.upper(), 0) for base in seq]  # Default to PAD
+            ids = [self.rna_vocab.get(base.upper(), 0) for base in seq]
             batch_ids.append(ids)
-
         return torch.tensor(batch_ids, dtype=torch.long, device=self.device)
 
     def ids_to_sequence(self, token_ids):
-        """Convert token IDs back to RNA sequences"""
         if token_ids.dim() == 1:
             token_ids = token_ids.unsqueeze(0)
-
         sequences = []
         for ids in token_ids:
-            seq = ''.join([self.idx_to_base.get(idx.item(), 'N') for idx in ids if idx.item() != 0])
+            seq = "".join(
+                [self.idx_to_base.get(idx.item(), "N") for idx in ids if idx.item() != 0]
+            )
             sequences.append(seq)
-
         return sequences if len(sequences) > 1 else sequences[0]
+
+    def encode_backbone(self, x: torch.Tensor, timesteps: torch.Tensor, mask=None):
+        """Run continuous embeddings ``x`` [B,L,H] through the time-conditioned backbone."""
+        if mask is not None:
+            mask = mask.to(x.device)
+        h = self.pos_encoding(x)
+        time_emb = self.time_embedding(timesteps)
+        for layer in self.transformer_layers:
+            h = layer(h, time_emb, mask)
+        return self.output_norm(h)
 
     def forward(self, x, timesteps, mask=None, return_properties=True):
         """
-        Forward pass for denoising
-
         Args:
-            x: [B, L, H] embeddings or [B, L] token IDs
-            timesteps: [B] timesteps
-            mask: [B, L] attention mask (1 for valid tokens, 0 for padding)
-
+            x: continuous embeddings [B, L, H] (or token ids [B, L], embedded first)
+            timesteps: [B]
+            mask: [B, L] True = valid (non-pad) positions
         Returns:
-            Dictionary with predictions
+            token_logits [B, L, V], optional property_pred [B, P]
         """
-        if x.dim() == 2:  # Convert token IDs to embeddings
+        if x.dim() == 2:
             x = self.token_embedding(x)
-
+        h = self.encode_backbone(x, timesteps, mask)
+        token_logits = self.token_pred_head(h)
+        if not return_properties:
+            return token_logits
         if mask is not None:
-            mask = mask.to(x.device)
+            pooled = (h * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(
+                min=1
+            )
+        else:
+            pooled = h.mean(dim=1)
+        property_pred = self.property_head(pooled)
+        return token_logits, property_pred
 
-        # Add positional encoding
-        x = self.pos_encoding(x)
-
-        # Time embedding
-        time_emb = self.time_embedding(timesteps)
-
-        # Transformer layers
-        for layer in self.transformer_layers:
-            x = layer(x, time_emb, mask)
-
-        # Output
-        x = self.output_norm(x)
-        noise_pred = self.noise_pred_head(x)
-
-        # Property prediction
-        if return_properties:
-            if mask is not None:
-                # Pool over valid tokens only
-                pooled = (x * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1)
-            else:
-                pooled = x.mean(dim=1)
-            property_pred = self.property_head(pooled)
-            return noise_pred, property_pred
-
-        return noise_pred
-
-    def add_noise(self, x_0, t):
-        """
-        Add Gaussian noise to embeddings for forward diffusion process
-
-        Args:
-            x_0: Clean sequences [B, L] token IDs or [B, L, H] embeddings
-            t: Timesteps [B]
-
-        Returns:
-            x_t: Noisy embeddings [B, L, H]
-            noise: Added noise [B, L, H]
-        """
-        if x_0.dim() == 2:  # Convert tokens to embeddings
+    def add_noise(self, x_0: torch.Tensor, t: torch.Tensor):
+        """Gaussian forward corruption on embeddings: ``x_t = √ᾱ x_0 + √(1-ᾱ) ε``."""
+        if x_0.dim() == 2:
             x_0 = self.token_embedding(x_0)
-
-        # Linear noise schedule
-        alpha_t = 1.0 - (t.float() / self.max_timesteps)
-        alpha_t = alpha_t.view(-1, 1, 1)  # [B, 1, 1]
-
-        # Sample noise
-        noise = torch.randn_like(x_0) * self.noise_scale
-
-        # Add noise: x_t = sqrt(alpha_t) * x_0 + sqrt(1 - alpha_t) * noise
-        x_t = torch.sqrt(alpha_t) * x_0 + torch.sqrt(1 - alpha_t) * noise
-
+        ab = self.alpha_bar(t).view(-1, 1, 1)
+        noise = torch.randn_like(x_0)
+        x_t = torch.sqrt(ab) * x_0 + torch.sqrt(1.0 - ab) * noise
         return x_t, noise
 
     def compute_loss(self, x_0, targets=None, mask=None, recon_weight=1.0):
         """
-        Compute training loss
+        Train token CE from continuous noisy embeddings (+ property MSE).
 
         Args:
-            x_0: Clean sequences [B, L] token IDs
-            targets: Property targets [B, num_properties] (optional)
-            mask: Attention mask [B, L]
-
-        Returns:
-            Dictionary of losses, property predictions
+            x_0: clean token ids [B, L]
+            targets: property targets [B, P]
+            mask: attention / non-pad mask [B, L]
         """
         batch_size = x_0.shape[0]
-
-        # Sample random timesteps
         t = torch.randint(0, self.max_timesteps, (batch_size,), device=x_0.device)
+        x_t, _noise = self.add_noise(x_0, t)
+        token_logits, property_pred = self.forward(x_t, t, mask)
 
-        # Add noise
-        x_t, noise = self.add_noise(x_0, t)
+        # CE over non-pad positions (continuous denoising of the sequence).
+        ce = F.cross_entropy(
+            token_logits.reshape(-1, self.vocab_size),
+            x_0.reshape(-1),
+            reduction="none",
+        ).view(batch_size, -1)
+        if mask is not None:
+            m = mask.float()
+            recon_loss = (ce * m).sum() / m.sum().clamp(min=1.0)
+        else:
+            recon_loss = ce.mean()
 
-        # Forward pass
-        noise_pred, property_pred = self.forward(x_t, t, mask)
-
-        # Reconstruction loss: predict the noise
-        recon_loss = F.mse_loss(noise_pred, noise)
-
-        # Property prediction loss
+        prop_loss = torch.zeros((), device=x_0.device)
         if targets is not None:
             prop_loss = F.mse_loss(property_pred, targets)
 
         total_loss = recon_weight * recon_loss + prop_loss
-
         return total_loss, recon_loss, prop_loss, property_pred
 
-    def sample(self, batch_size, num_steps=10, hijack_step=None, guidance_kwargs=None, mask=None, return_traj=False):
-        f"""
-        Sample RNA sequences using guided diffusion
+    def _decode_tokens(self, token_logits: torch.Tensor, *, temperature: float = 1.0):
+        """Sample / argmax tokens from logits; never emit PAD during generation."""
+        logits = token_logits.clone()
+        logits[..., self.pad_id] = float("-inf")
+        if temperature <= 0:
+            return torch.argmax(logits, dim=-1)
+        probs = torch.softmax(logits / max(temperature, 1e-6), dim=-1)
+        return torch.multinomial(probs.view(-1, self.vocab_size), 1).view(
+            token_logits.shape[0], token_logits.shape[1]
+        )
 
-        Args:
-            batch_size: Number of sequences to generate
-            num_steps: Number of denoising steps
-            hijack_step: If not None, early stop to return intermediate result.
-            guidance_kwargs: Dict with guidance parameters
-            mask: Attention mask for generated sequences
-            return_traj: Whether to return trajectories
+    def _continuous_transition(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        t_prev: torch.Tensor,
+        mask=None,
+        *,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """NOS-C reverse step: decode tokens → re-embed → Gaussian re-noise to ``t_prev``.
 
-        Returns:
-            Generated token sequences [B, L]
-            traj: [N_steps, B, L]
+        This is the continuous transition (embedding-space), not a discrete token jump.
         """
+        token_logits, _ = self.forward(x_t, t, mask)
+        tokens = self._decode_tokens(token_logits, temperature=temperature)
+        # Respect pad positions in the attention mask if provided.
+        if mask is not None:
+            tokens = torch.where(mask, tokens, torch.zeros_like(tokens))
+        x0_hat = self.token_embedding(tokens)
+        ab_prev = self.alpha_bar(t_prev).view(-1, 1, 1)
+        # When t_prev == 0, return the clean embedding estimate (no extra noise).
+        noise = torch.randn_like(x0_hat)
+        x_prev = torch.sqrt(ab_prev) * x0_hat + torch.sqrt(1.0 - ab_prev) * noise
+        at_zero = (t_prev <= 0).view(-1, 1, 1)
+        return torch.where(at_zero, x0_hat, x_prev)
+
+    def _langevin_guide(self, x_t: torch.Tensor, t: torch.Tensor, guidance_kwargs, mask):
+        """Property gradient steps in continuous embedding space (NOS guidance)."""
+        step_size = float(guidance_kwargs.get("step_size", 0.1))
+        stability_coef = float(guidance_kwargs.get("stability_coef", 0.01))
+        n_langevin = int(guidance_kwargs.get("n_langevin", 1))
+        target_values = guidance_kwargs["target_values"]
+
+        x = x_t
+        for _ in range(max(n_langevin, 1)):
+            x = x.detach().requires_grad_(True)
+            _logits, property_pred = self.forward(x, t, mask)
+            if isinstance(target_values, (int, float)):
+                tgt = torch.full_like(property_pred, float(target_values))
+            elif isinstance(target_values, (list, tuple)):
+                tgt = torch.tensor(target_values, device=self.device, dtype=property_pred.dtype)
+                tgt = tgt.view(1, -1).expand_as(property_pred)
+            else:
+                tgt = target_values.to(device=self.device, dtype=property_pred.dtype)
+                if tgt.dim() == 1:
+                    tgt = tgt.unsqueeze(-1)
+                tgt = tgt.expand_as(property_pred)
+
+            guidance_loss = F.mse_loss(property_pred, tgt)
+            grad = torch.autograd.grad(guidance_loss, x, retain_graph=False)[0]
+            with torch.no_grad():
+                x = x - step_size * grad
+                if stability_coef > 0:
+                    x = x + stability_coef * torch.randn_like(x)
+        return x.detach()
+
+    def sample(
+        self,
+        batch_size,
+        num_steps=50,
+        hijack_step=None,
+        guidance_kwargs=None,
+        mask=None,
+        return_traj=False,
+        temperature: float = 1.0,
+    ):
+        """Sample via continuous reverse diffusion in embedding space."""
         if guidance_kwargs is None:
             guidance_kwargs = {}
+        if mask is None:
+            mask = torch.ones(batch_size, self.seq_len, dtype=torch.bool, device=self.device)
+        else:
+            mask = mask.to(self.device)
+            if mask.dtype != torch.bool:
+                mask = mask.bool()
 
-        # Start from random noise in embedding space
+        # Prior: isotropic Gaussian in embedding space (continuous path).
         x = torch.randn(batch_size, self.seq_len, self.hidden_dim, device=self.device)
-
         trajs = []
-        # Denoising loop
+        num_steps = int(num_steps)
+        step = max(self.max_timesteps // max(num_steps, 1), 1)
+
         for i in reversed(range(num_steps)):
-            t = torch.full((batch_size,), i * (self.max_timesteps // num_steps),
-                          device=self.device, dtype=torch.long)
+            t_val = i * step
+            t_prev_val = max((i - 1) * step, 0) if i > 0 else 0
+            t = torch.full((batch_size,), t_val, device=self.device, dtype=torch.long)
+            t_prev = torch.full((batch_size,), t_prev_val, device=self.device, dtype=torch.long)
 
             if "target_values" in guidance_kwargs and self.num_properties > 0:
-                x = self._guided_step(x, t, guidance_kwargs, mask)
-            else:
-                x = self._denoising_step(x, t, mask)
-            
+                x = self._langevin_guide(x, t, guidance_kwargs, mask)
+
+            with torch.no_grad():
+                x = self._continuous_transition(
+                    x, t, t_prev, mask, temperature=temperature
+                )
+
             if return_traj:
-                # Convert embeddings to tokens
                 with torch.no_grad():
-                    # Project embeddings to vocabulary space
-                    token_logits = self.token_embedding.weight @ x.transpose(-2, -1)  # [V, H] @ [B, H, L] -> [B, V, L]
-                    token_logits = token_logits.transpose(-2, -1)  # [B, L, V]
-                    tokens = torch.argmax(token_logits, dim=-1)
-                trajs.append(tokens[None, :])
+                    logits, _ = self.forward(x, t_prev, mask)
+                    trajs.append(self._decode_tokens(logits, temperature=0.0)[None, :])
 
             if hijack_step is not None and i == (num_steps - hijack_step):
                 break
 
-        # Convert embeddings to tokens
         with torch.no_grad():
-            # Project embeddings to vocabulary space
-            token_logits = self.token_embedding.weight @ x.transpose(-2, -1)  # [V, H] @ [B, H, L] -> [B, V, L]
-            token_logits = token_logits.transpose(-2, -1)  # [B, L, V]
-            tokens = torch.argmax(token_logits, dim=-1)
-
-        if return_traj:
-            trajs = torch.cat(trajs, dim=0) # [n_steps, B, L]
-
-        #import pdb; pdb.set_trace()
-
+            t0 = torch.zeros(batch_size, device=self.device, dtype=torch.long)
+            logits, _ = self.forward(x, t0, mask)
+            tokens = self._decode_tokens(logits, temperature=0.0)
+            if mask is not None:
+                tokens = torch.where(mask, tokens, torch.zeros_like(tokens))
         return tokens, trajs
-        
-
-    def _denoising_step(self, x_t, t, mask):
-        """Single denoising step without guidance"""
-        noise_pred, property_pred = self.forward(x_t, t, mask)
-
-        # Reverse diffusion: x_0 = (x_t - sqrt(1-alpha_t) * noise) / sqrt(alpha_t)
-        alpha_t = 1.0 - (t.float() / self.max_timesteps)
-        alpha_t = alpha_t.view(-1, 1, 1)
-
-        x_pred = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
-        return x_pred
-
-    def _guided_step(self, x_t, t, guidance_kwargs, mask):
-        """Guided denoising step using property gradients"""
-        step_size = guidance_kwargs.get("step_size", 1.0)
-        stability_coef = guidance_kwargs.get("stability_coef", 0.01)
-        target_values = guidance_kwargs["target_values"]
-
-        # Enable gradients for guidance
-        x_t.requires_grad_(True)
-
-        # Forward pass
-        noise_pred, property_pred = self.forward(x_t, t, mask)
-
-        if self.num_properties > 0:
-            # Convert target values to tensor
-            if isinstance(target_values, (int, float)):
-                target_values = torch.full_like(property_pred, target_values)
-            elif isinstance(target_values, (list, tuple)):
-                target_values = torch.tensor(target_values, device=self.device).expand_as(property_pred)
-
-            # Compute guidance loss
-            guidance_loss = F.mse_loss(property_pred, target_values)
-
-            # Compute gradients w.r.t. hidden states
-            grad = torch.autograd.grad(guidance_loss, x_t, retain_graph=True)[0]
-
-            # Apply guided update
-            with torch.no_grad():
-                x_t = x_t - step_size * grad
-                # Add stability regularization
-                x_t = x_t + stability_coef * torch.randn_like(x_t)
-
-        # Detach and perform regular denoising step
-        x_t = x_t.detach()
-        return self._denoising_step(x_t, t, mask)
 
     def optimize(
         self,
         sequences,
         *,
         target_direction="increase",
-        num_steps=10,
+        num_steps=50,
         step_size=0.1,
-        stability_coef=5.0,
+        stability_coef=0.01,
         target_abs=1.0,
         mask=None,
+        n_langevin: int = 1,
+        temperature: float = 1.0,
     ):
-        """Guided denoising starting from seed sequences ``[B, L]``."""
+        """Property-guided NOS-C sampling (continuous embedding reverse chain).
+
+        ``sequences`` only sets batch size / optional mask shape (de-novo from noise).
+        """
         sequences = sequences.to(self.device)
         if sequences.dim() == 1:
             sequences = sequences.unsqueeze(0)
-        batch_size = sequences.shape[0]
+        batch_size, seq_len = sequences.shape
         if mask is None:
-            mask = (sequences != 0).float()
+            mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=self.device)
         else:
-            mask = mask.float().to(self.device)
+            mask = mask.to(self.device)
+            if mask.dtype != torch.bool:
+                mask = mask.bool()
 
         target = float(target_abs) if target_direction == "increase" else -float(target_abs)
         guidance_kwargs = {
             "step_size": float(step_size),
             "stability_coef": float(stability_coef),
             "target_values": [target],
+            "n_langevin": int(n_langevin),
         }
-
-        # Forward-corrupt seed embeddings, then reverse with property guidance.
-        steps = max(int(num_steps), 1)
-        t0 = torch.full(
-            (batch_size,),
-            max(steps - 1, 0) * (self.max_timesteps // steps),
-            device=self.device,
-            dtype=torch.long,
+        tokens, _traj = self.sample(
+            batch_size,
+            num_steps=num_steps,
+            guidance_kwargs=guidance_kwargs,
+            mask=mask,
+            return_traj=False,
+            temperature=temperature,
         )
-        x, _ = self.add_noise(sequences, t0)
-        for i in reversed(range(steps)):
-            t = torch.full(
-                (batch_size,),
-                i * (self.max_timesteps // steps),
-                device=self.device,
-                dtype=torch.long,
-            )
-            x = self._guided_step(x, t, guidance_kwargs, mask)
-
-        with torch.no_grad():
-            token_logits = self.token_embedding.weight @ x.transpose(-2, -1)
-            token_logits = token_logits.transpose(-2, -1)
-            tokens = torch.argmax(token_logits, dim=-1)
         return tokens
 
     def generate_sequences(self, batch_size, num_steps=50, guidance_kwargs=None, mask=None):
-        """
-        Generate RNA sequences as strings
-
-        Returns:
-            List of RNA sequence strings
-        """
-        tokens = self.sample(batch_size, num_steps, guidance_kwargs, mask)
+        tokens, _ = self.sample(batch_size, num_steps, guidance_kwargs, mask)
         return self.ids_to_sequence(tokens)
 
 
 class NOSTransformerBlock(nn.Module):
-    """Transformer block with time conditioning for NOS"""
-
     def __init__(self, hidden_dim, num_heads, dropout=0.1):
         super().__init__()
-
         self.self_attention = nn.MultiheadAttention(
             hidden_dim, num_heads, dropout=dropout, batch_first=True
         )
@@ -405,121 +369,66 @@ class NOSTransformerBlock(nn.Module):
             nn.Linear(hidden_dim, 4 * hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(4 * hidden_dim, hidden_dim)
+            nn.Linear(4 * hidden_dim, hidden_dim),
         )
-
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
-
-        # Time conditioning via Adaptive Layer Normalization
-        self.time_proj = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 2 * hidden_dim)
-        )
-
+        self.time_proj = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, 2 * hidden_dim))
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, time_emb, mask=None):
-        # Time conditioning via AdaLN
         time_out = self.time_proj(time_emb)
         scale, shift = time_out.chunk(2, dim=-1)
-
-        # Self-attention with time conditioning
         x_norm = self.norm1(x)
         x_norm = x_norm * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
-        # Convert mask to key_padding_mask format
-        if mask is not None:
-            key_padding_mask = ~mask.bool()  # True for positions to ignore
-        else:
-            key_padding_mask = None
-
-        attn_out, _ = self.self_attention(x_norm, x_norm, x_norm, key_padding_mask=key_padding_mask)
+        key_padding_mask = (~mask.bool()) if mask is not None else None
+        attn_out, _ = self.self_attention(
+            x_norm, x_norm, x_norm, key_padding_mask=key_padding_mask
+        )
         x = x + self.dropout(attn_out)
-
-        # Feed-forward network
-        x_norm = self.norm2(x)
-        ffn_out = self.ffn(x_norm)
-        x = x + self.dropout(ffn_out)
-
+        x = x + self.dropout(self.ffn(self.norm2(x)))
         return x
 
 
 class TimeEmbedding(nn.Module):
-    """Sinusoidal time embedding for diffusion timesteps"""
-
     def __init__(self, hidden_dim):
         super().__init__()
         self.hidden_dim = hidden_dim
-
         self.time_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(hidden_dim, hidden_dim),
         )
 
     def forward(self, timesteps):
-        # Create sinusoidal embeddings
         half_dim = self.hidden_dim // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=timesteps.device) * -emb)
-        emb = timesteps[:, None] * emb[None, :]
+        emb = timesteps[:, None].float() * emb[None, :]
         emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
-
         return self.time_mlp(emb)
 
 
 class PositionalEncoding(nn.Module):
-    """Sinusoidal positional encoding"""
-
     def __init__(self, hidden_dim, max_len=5000):
         super().__init__()
-
         pe = torch.zeros(max_len, hidden_dim)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, hidden_dim, 2).float() *
-                            (-math.log(10000.0) / hidden_dim))
-
+        div_term = torch.exp(
+            torch.arange(0, hidden_dim, 2).float() * (-math.log(10000.0) / hidden_dim)
+        )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-
-        self.register_buffer('pe', pe)
+        self.register_buffer("pe", pe)
 
     def forward(self, x):
-        return x + self.pe[:x.size(1)].unsqueeze(0)
-
-
-def training_step(model, batch, optimizer):
-    """
-    Single training step for NOS-C
-
-    Args:
-        model: NOSC model
-        batch: Dict with 'sequences', 'targets', 'mask'
-        optimizer: PyTorch optimizer
-
-    Returns:
-        Dictionary of loss values
-    """
-    sequences = batch['sequences']  # [B, L] RNA token IDs
-    targets = batch.get('targets', None)  # [B, num_properties] property values
-    mask = batch.get('mask', None)  # [B, L] attention mask
-
-    # Compute losses
-    losses, property_pred = model.compute_loss(sequences, targets, mask)
-
-    # Backward pass
-    optimizer.zero_grad()
-    losses['total_loss'].backward()
-    optimizer.step()
-
-    return {k: v.item() if torch.is_tensor(v) else v for k, v in losses.items()}
+        return x + self.pe[: x.size(1)].unsqueeze(0)
 
 
 if __name__ == "__main__":
     torch.manual_seed(0)
     batch_size, seq_len = 2, 16
-    model = NOS_C(seq_len=seq_len, num_properties=1, device="cpu")
+    model = NOS_C(seq_len=seq_len, num_properties=1, device="cpu", max_timesteps=20)
     sequences = torch.randint(1, model.vocab_size, (batch_size, seq_len))
     targets = torch.randn(batch_size, 1)
     mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
@@ -527,13 +436,26 @@ if __name__ == "__main__":
     total, recon, prop, pred = model.compute_loss(sequences, targets, mask)
     assert total.ndim == 0 and pred.shape == (batch_size, 1)
 
-    tokens, _traj = model.sample(batch_size=batch_size, num_steps=5, return_traj=False)
+    tokens, _traj = model.sample(batch_size=batch_size, num_steps=10, return_traj=False)
     assert tokens.shape == (batch_size, seq_len)
+    assert not torch.isnan(tokens.float()).any()
+    # Should not collapse to all PAD.
+    assert (tokens != 0).any(), f"all-pad collapse: {tokens}"
 
     guided, _ = model.sample(
         batch_size=batch_size,
-        num_steps=5,
-        guidance_kwargs={"step_size": 1.0, "stability_coef": 0.01, "target_values": [0.5]},
+        num_steps=10,
+        guidance_kwargs={"step_size": 0.1, "stability_coef": 0.01, "target_values": [0.5]},
     )
     assert guided.shape == (batch_size, seq_len)
+    assert (guided != 0).any()
+
+    # Norms should stay finite across a longer untrained sample.
+    x = torch.randn(2, seq_len, model.hidden_dim)
+    for i in reversed(range(20)):
+        t = torch.full((2,), i, dtype=torch.long)
+        t_prev = torch.full((2,), max(i - 1, 0), dtype=torch.long)
+        with torch.no_grad():
+            x = model._continuous_transition(x, t, t_prev, mask)
+        assert torch.isfinite(x).all(), f"non-finite at step t={i}"
     print("NOS_C unit tests passed.")

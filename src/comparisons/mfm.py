@@ -1,27 +1,3 @@
-"""RNA-adapted Metric Flow Matching (MFM) baseline.
-
-Official MFM ([kkapusniak/metric-flow-matching](https://github.com/kkapusniak/metric-flow-matching),
-NeurIPS 2024, arXiv:2405.14780) learns smooth interpolations between
-*populations* on a data manifold: a geopath network bends CondOT paths
-with gamma(t)*g_theta(x0,x1,t), an optional data-dependent (LAND/RBF) metric
-regularizes path velocity, and a flow network matches the resulting
-conditional velocity.
-
-Baseline adaptation (RNA property optimization):
-* Partition each training batch into low / high property subpopulations by
-  the median ground-truth label (MFM needs two populations).
-* Train flows low -> high (maximization) and high -> low (minimization) with
-  minibatch OT coupling, MetricFlowMatcher paths (geopath + LAND velocity
-  regularizer), and a joint property head (same trainer protocol as EM/MPGD).
-* At optimize / sample time, integrate the direction-conditioned velocity
-  field from seed (test) sequences.
-
-Intentional simplifications vs the official code: no pytorch-lightning /
-torchcfm / torchdyn / RBF metric pretraining / image VAE; CondOT uses
-``scipy.optimize.linear_sum_assignment``; LAND metric is applied on flattened
-continuous one-hots; geopath + flow train jointly in ``compute_loss``.
-"""
-
 from __future__ import annotations
 
 import math
@@ -34,42 +10,15 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 
-def _pad_t_like_x(t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """Broadcast scalar/batch times ``t`` to ``x``'s trailing dims."""
-    if t.ndim == 0:
-        t = t.view(1).expand(x.shape[0])
-    while t.ndim < x.ndim:
-        t = t.unsqueeze(-1)
-    return t
-
-
-def _land_metric_diag(
-    x: torch.Tensor,
-    samples: torch.Tensor,
-    gamma: float,
-    rho: float,
-) -> torch.Tensor:
-    """Diagonal LAND inverse-metric at ``x`` using reference ``samples``.
-
-    Args:
-        x: ``[B, D]``
-        samples: ``[N, D]``
-        gamma, rho: LAND bandwidth / ridge (official geo_metrics/land.py).
-
-    Returns:
-        ``M_inv`` of shape ``[B, D]`` (diagonal inverse metric).
-    """
-    # weights[b,n] = exp(-||x_b - s_n||^2 / (2 gamma^2))
-    pairwise_sq = ((x[:, None, :] - samples[None, :, :]) ** 2).sum(dim=-1)
-    weights = torch.exp(-pairwise_sq / (2.0 * gamma * gamma + 1e-12))
-    differences = samples[None, :, :] - x[:, None, :]
-    squared = differences**2
-    m_diag = torch.einsum("bn,bnd->bd", weights, squared) + float(rho)
-    return 1.0 / m_diag.clamp(min=1e-8)
-
-
 class MFM(nn.Module):
-    """Metric Flow Matching for RNA sequences (population low <-> high)."""
+    """MFM learns manifold-aware flows between populations for guided sequence transport.
+
+    Originally developed for smooth interpolations on data manifolds. This RNA adaptation uses
+    property-defined sequence populations on nucleotide sequences.
+
+    Paper: Metric Flow Matching for Smooth Interpolations on the Data Manifold (NeurIPS 2024)
+    Github: https://github.com/kkapusniak/metric-flow-matching
+    """
 
     def __init__(
         self,
@@ -463,6 +412,40 @@ class MFM(nn.Module):
             pad_mask=pad_mask,
             return_traj=False,
         )
+
+
+def _pad_t_like_x(t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Broadcast scalar/batch times ``t`` to ``x``'s trailing dims."""
+    if t.ndim == 0:
+        t = t.view(1).expand(x.shape[0])
+    while t.ndim < x.ndim:
+        t = t.unsqueeze(-1)
+    return t
+
+
+def _land_metric_diag(
+    x: torch.Tensor,
+    samples: torch.Tensor,
+    gamma: float,
+    rho: float,
+) -> torch.Tensor:
+    """Diagonal LAND inverse-metric at ``x`` using reference ``samples``.
+
+    Args:
+        x: ``[B, D]``
+        samples: ``[N, D]``
+        gamma, rho: LAND bandwidth / ridge.
+
+    Returns:
+        ``M_inv`` of shape ``[B, D]`` (diagonal inverse metric).
+    """
+    # weights[b,n] = exp(-||x_b - s_n||^2 / (2 gamma^2))
+    pairwise_sq = ((x[:, None, :] - samples[None, :, :]) ** 2).sum(dim=-1)
+    weights = torch.exp(-pairwise_sq / (2.0 * gamma * gamma + 1e-12))
+    differences = samples[None, :, :] - x[:, None, :]
+    squared = differences**2
+    m_diag = torch.einsum("bn,bnd->bd", weights, squared) + float(rho)
+    return 1.0 / m_diag.clamp(min=1e-8)
 
 
 class _SinusoidalPositionalEncoding(nn.Module):

@@ -22,3 +22,6 @@ results/
 *.h5
 *.png
 *.ckpt
+
+# Third-party RhoFold clone + weights (fetched by bash/setup_rhofold.sh)
+external_src/
