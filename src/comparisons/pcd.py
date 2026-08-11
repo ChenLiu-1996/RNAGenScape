@@ -8,10 +8,12 @@ import torch.nn.functional as F
 
 
 class PCD(nn.Module):
-    """PCD trains an energy-based model with persistent Markov chains and samples with property-guided dynamics.
+    """PCD trains a multinomial RBM with persistent Gibbs chains and property-guided discrete sampling.
 
-    Originally persistent contrastive divergence for energy-based / RBM training. This RNA adaptation
-    applies PCD to nucleotide sequence modeling with property-guided sampling.
+    Originally persistent contrastive divergence for binary RBMs (Tieleman, ICML 2008). This RNA
+    adaptation uses multinomial visibles (one categorical unit per nucleotide site), paper-style
+    PCD training (persistent fantasies, one Gibbs step per update, chains = minibatch), and
+    discrete property-guided Gibbs for seed-started optimization.
 
     Paper: Training Restricted Boltzmann Machines using Approximations to the Likelihood Gradient (ICML 2008)
     Github: N/A
@@ -22,13 +24,12 @@ class PCD(nn.Module):
         vocab_size: int = 7,
         seq_len: int = 150,
         hidden_dim: int = 256,
-        n_gibbs: int = 5,
-        buffer_size: int = 256,
-        langevin_step: float = 0.05,
-        langevin_noise: float = 0.01,
+        n_gibbs: int = 1,
+        buffer_size: int = 128,
         num_properties: int = 1,
         prop_hidden: int = 128,
         dropout: float = 0.1,
+        pad_token_id: int = 0,
         device: Optional[Union[str, torch.device]] = None,
     ):
         super().__init__()
@@ -40,28 +41,22 @@ class PCD(nn.Module):
 
         self.vocab_size = int(vocab_size)
         self.seq_len = int(seq_len)
-        self.visible_dim = self.seq_len * self.vocab_size
         self.hidden_dim = int(hidden_dim)
         self.n_gibbs = int(n_gibbs)
         self.buffer_size = int(buffer_size)
-        self.langevin_step = float(langevin_step)
-        self.langevin_noise = float(langevin_noise)
         self.num_properties = int(num_properties)
+        self.pad_token_id = int(pad_token_id)
 
-        # Classical RBM parameters: E(v,h) = -v^T W h - b^T v - c^T h
-        self.W = nn.Parameter(torch.randn(self.visible_dim, self.hidden_dim) * 0.01)
-        self.b = nn.Parameter(torch.zeros(self.visible_dim))
+        # Multinomial RBM: one categorical visible per site.
+        # E(v,h) = -sum_i b[i,v_i] - sum_j c_j h_j - sum_{i,j} W[i,v_i,j] h_j
+        self.W = nn.Parameter(torch.randn(self.seq_len, self.vocab_size, self.hidden_dim) * 0.01)
+        self.b = nn.Parameter(torch.zeros(self.seq_len, self.vocab_size))
         self.c = nn.Parameter(torch.zeros(self.hidden_dim))
 
-        # Persistent fantasy particles in {0,1}^{D} (registered buffer, not a param).
-        self.register_buffer(
-            "fantasy_v",
-            torch.bernoulli(torch.full((self.buffer_size, self.visible_dim), 0.5)),
-            persistent=True,
-        )
-        self.register_buffer("_fantasy_ptr", torch.zeros((), dtype=torch.long), persistent=True)
+        # Persistent fantasy particles as token ids [buffer, L] (paper: chains ~= minibatch).
+        init = torch.randint(1, max(self.vocab_size, 2), (self.buffer_size, self.seq_len))
+        self.register_buffer("fantasy_tokens", init, persistent=True)
 
-        # Property head on continuous sequence view (joint training).
         self.prop_input = nn.Linear(self.vocab_size, prop_hidden)
         self.property_head = nn.Sequential(
             nn.Linear(prop_hidden, 64),
@@ -75,77 +70,115 @@ class PCD(nn.Module):
         self.to(self.device)
 
     # ------------------------------------------------------------------ utils
-    def _tokens_to_binary(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """One-hot flatten to binary visibles ``[B, L*V]`` in {0,1}."""
-        oh = F.one_hot(token_ids.long(), num_classes=self.vocab_size).float()
-        return oh.reshape(token_ids.shape[0], self.visible_dim)
+    def _one_hot(self, tokens: torch.Tensor) -> torch.Tensor:
+        return F.one_hot(tokens.long(), num_classes=self.vocab_size).float()
 
-    def _tokens_to_continuous(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Continuous one-hots in [-1,1], shape ``[B, L, V]``."""
-        return F.one_hot(token_ids.long(), num_classes=self.vocab_size).float() * 2.0 - 1.0
+    def _default_pad_mask(self, tokens: torch.Tensor) -> torch.Tensor:
+        return tokens != self.pad_token_id
 
-    def _binary_to_seq(self, v: torch.Tensor) -> torch.Tensor:
-        """Map flat visibles ``[B, L*V]`` -> sequence continuous ``[B, L, V]`` in [-1,1]."""
-        x = v.reshape(-1, self.seq_len, self.vocab_size)
-        return x * 2.0 - 1.0
+    def free_energy(self, tokens: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """RBM free energy F(v) for multinomial token sequences ``[B, L]``."""
+        oh = self._one_hot(tokens)
+        if pad_mask is None:
+            pad_mask = self._default_pad_mask(tokens)
+        oh = oh * pad_mask.unsqueeze(-1).float()
+        fe = -(oh * self.b.unsqueeze(0)).sum(dim=(1, 2))
+        pre_h = self.c.unsqueeze(0) + torch.einsum("blv,lvh->bh", oh, self.W)
+        return fe - F.softplus(pre_h).sum(dim=-1)
 
-    def _seq_to_flat01(self, x: torch.Tensor) -> torch.Tensor:
-        """Map continuous ``[B,L,V]`` in [-1,1] -> soft visibles in [0,1]."""
-        return ((x + 1.0) * 0.5).clamp(0.0, 1.0).reshape(x.shape[0], self.visible_dim)
-
-    def free_energy(self, v: torch.Tensor) -> torch.Tensor:
-        """RBM free energy ``F(v)`` for soft/binary visibles ``[B, D]``.
-
-        ``F(v) = -b^T v - sum_j softplus(c_j + W_j^T v)``
-        (up to an additive constant; lower = more likely under the model).
-        """
-        pre_h = self.c.unsqueeze(0) + v @ self.W
-        return -v @ self.b - F.softplus(pre_h).sum(dim=-1)
-
-    def energy(self, continuous_x: torch.Tensor) -> torch.Tensor:
-        """Free energy of continuous sequence ``[B, L, V]`` in [-1,1]."""
-        return self.free_energy(self._seq_to_flat01(continuous_x))
-
-    # --------------------------------------------------------------- PCD Gibbs
+    # --------------------------------------------------------------- Gibbs
     @torch.no_grad()
-    def _sample_h_given_v(self, v: torch.Tensor) -> torch.Tensor:
-        p_h = torch.sigmoid(self.c.unsqueeze(0) + v @ self.W)
+    def _sample_h_given_v(self, tokens: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        oh = self._one_hot(tokens)
+        if pad_mask is None:
+            pad_mask = self._default_pad_mask(tokens)
+        oh = oh * pad_mask.unsqueeze(-1).float()
+        p_h = torch.sigmoid(self.c.unsqueeze(0) + torch.einsum("blv,lvh->bh", oh, self.W))
         return torch.bernoulli(p_h)
 
-    @torch.no_grad()
-    def _sample_v_given_h(self, h: torch.Tensor) -> torch.Tensor:
-        p_v = torch.sigmoid(self.b.unsqueeze(0) + h @ self.W.t())
-        return torch.bernoulli(p_v)
+    def _visible_logits(self, h: torch.Tensor) -> torch.Tensor:
+        """Categorical logits ``[B, L, V]`` for visibles given hidden sample ``[B, H]``."""
+        return self.b.unsqueeze(0) + torch.einsum("bh,lvh->blv", h, self.W)
 
     @torch.no_grad()
-    def _gibbs_k(self, v: torch.Tensor, k: int) -> torch.Tensor:
-        out = v
+    def _sample_v_given_h(
+        self,
+        h: torch.Tensor,
+        *,
+        pad_mask: Optional[torch.Tensor] = None,
+        logits: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Multinomial Gibbs update of visibles (pad sites stay pad; pad id blocked elsewhere)."""
+        if logits is None:
+            logits = self._visible_logits(h)
+        logits = logits.clone()
+        # Never emit pad on content sites.
+        logits[..., self.pad_token_id] = -1e9
+        probs = F.softmax(logits, dim=-1)
+        flat = probs.reshape(-1, self.vocab_size)
+        sampled = torch.multinomial(flat, num_samples=1).reshape(h.shape[0], self.seq_len)
+        if pad_mask is None:
+            return sampled
+        pad_mask = pad_mask.bool()
+        return torch.where(pad_mask, sampled, torch.full_like(sampled, self.pad_token_id))
+
+    @torch.no_grad()
+    def _gibbs_k(
+        self,
+        tokens: torch.Tensor,
+        k: int,
+        *,
+        pad_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        out = tokens
         for _ in range(max(int(k), 1)):
-            h = self._sample_h_given_v(out)
-            out = self._sample_v_given_h(h)
+            h = self._sample_h_given_v(out, pad_mask=pad_mask)
+            out = self._sample_v_given_h(h, pad_mask=pad_mask)
         return out
 
+    def _ensure_fantasy(self, batch_size: int, template: torch.Tensor) -> None:
+        """Keep fantasy chain count equal to the minibatch (paper PCD recipe)."""
+        if (
+            self.fantasy_tokens is not None
+            and self.fantasy_tokens.shape[0] == batch_size
+            and self.fantasy_tokens.shape[1] == template.shape[1]
+        ):
+            return
+        init = torch.randint(
+            1,
+            max(self.vocab_size, 2),
+            (batch_size, template.shape[1]),
+            device=template.device,
+            dtype=torch.long,
+        )
+        pad_mask = template[0] != self.pad_token_id
+        init = torch.where(pad_mask.unsqueeze(0), init, torch.full_like(init, self.pad_token_id))
+        self.register_buffer("fantasy_tokens", init, persistent=True)
+        self.buffer_size = batch_size
+
     @torch.no_grad()
-    def _pcd_negatives(self, batch_size: int) -> torch.Tensor:
-        """Advance persistent chains and return ``batch_size`` negatives."""
-        n = self.fantasy_v.shape[0]
-        # Round-robin slice from the fantasy buffer.
-        ptr = int(self._fantasy_ptr.item()) % n
-        idx = [(ptr + i) % n for i in range(batch_size)]
-        idx_t = torch.as_tensor(idx, device=self.fantasy_v.device, dtype=torch.long)
-        v0 = self.fantasy_v[idx_t]
-        v_k = self._gibbs_k(v0, self.n_gibbs)
-        self.fantasy_v[idx_t] = v_k
-        self._fantasy_ptr.fill_((ptr + batch_size) % n)
+    def _pcd_negatives(self, tokens_pos: torch.Tensor, pad_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """Advance all persistent chains by ``n_gibbs`` full Gibbs steps; return negatives."""
+        batch_size = tokens_pos.shape[0]
+        self._ensure_fantasy(batch_size, tokens_pos)
+        v_k = self._gibbs_k(self.fantasy_tokens, self.n_gibbs, pad_mask=pad_mask)
+        self.fantasy_tokens.copy_(v_k)
         return v_k
 
     # ------------------------------------------------------------- property
     def predict_property(
         self,
-        continuous_x: torch.Tensor,
+        tokens_or_oh: torch.Tensor,
         pad_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        h = self.prop_input(continuous_x)
+        """Property head on one-hot ``[B, L, V]`` or token ids ``[B, L]``."""
+        if tokens_or_oh.dim() == 2:
+            oh = self._one_hot(tokens_or_oh)
+            if pad_mask is None:
+                pad_mask = self._default_pad_mask(tokens_or_oh)
+        else:
+            oh = tokens_or_oh.float()
+        h = self.prop_input(oh)
         if pad_mask is None:
             pooled = h.mean(dim=1)
         else:
@@ -161,32 +194,21 @@ class PCD(nn.Module):
         mask: Optional[torch.Tensor] = None,
         recon_weight: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """PCD contrastive loss ``E_data - E_model`` + property MSE.
-
-        Args:
-            x_0: token ids ``[B, L]``
-            targets: property labels ``[B]`` or ``[B, P]``
-            mask: bool pad mask True=valid (used by property head)
-            recon_weight: weight on generative loss
-
-        Returns:
-            total_loss, gen_loss (PCD), property_loss, property_pred ``[B, P]``
-        """
+        """PCD loss ``F(data) - F(fantasy)`` + property MSE (Tieleman 2008 + RNA property head)."""
         if x_0.dim() != 2:
             raise ValueError(f"Expected token ids [B, L], got shape {tuple(x_0.shape)}")
 
-        v_pos = self._tokens_to_binary(x_0)
-        v_neg = self._pcd_negatives(v_pos.shape[0]).to(dtype=v_pos.dtype)
+        tokens = x_0.long()
+        pad_mask = mask if mask is not None else self._default_pad_mask(tokens)
+        v_neg = self._pcd_negatives(tokens, pad_mask)
 
-        # Contrastive divergence objective on free energies.
-        fe_pos = self.free_energy(v_pos)
-        fe_neg = self.free_energy(v_neg)
+        fe_pos = self.free_energy(tokens, pad_mask=pad_mask)
+        fe_neg = self.free_energy(v_neg, pad_mask=pad_mask)
         gen_loss = fe_pos.mean() - fe_neg.mean()
 
-        continuous = self._tokens_to_continuous(x_0)
-        prop_pred = self.predict_property(continuous, pad_mask=mask)
+        prop_pred = self.predict_property(tokens, pad_mask=pad_mask)
         if targets is None:
-            prop_loss = torch.zeros((), device=x_0.device)
+            prop_loss = torch.zeros((), device=tokens.device)
         else:
             targets = targets.float()
             if targets.dim() == 1:
@@ -196,29 +218,25 @@ class PCD(nn.Module):
         total = recon_weight * gen_loss + prop_loss
         return total, gen_loss, prop_loss, prop_pred
 
-    # ------------------------------------------------------ Langevin sample
-    def _energy_grad(
+    # ------------------------------------------------------ discrete sample
+    def _guided_visible_logits(
         self,
-        x: torch.Tensor,
+        tokens: torch.Tensor,
+        h: torch.Tensor,
         *,
         pad_mask: Optional[torch.Tensor],
         guidance: bool,
         direction: float,
         guide_scale: float,
     ) -> torch.Tensor:
-        """``∇_x ( F(x) - direction * guide_scale * property(x) )``."""
-        x_req = x.detach().requires_grad_(True)
-        fe = self.energy(x_req)
-        objective = fe.sum()
-        if guidance and self.num_properties > 0 and guide_scale != 0.0:
-            pred = self.predict_property(x_req, pad_mask=pad_mask)
-            # Ascend property when direction > 0 => subtract from energy objective.
-            objective = objective - float(direction) * float(guide_scale) * pred.sum()
-        return torch.autograd.grad(objective, x_req, create_graph=False)[0]
-
-    @torch.no_grad()
-    def _decode_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        return x.argmax(dim=-1)
+        """RBM visible logits plus a discrete property bias from ``∇_onehot y``."""
+        logits = self._visible_logits(h)
+        if not (guidance and self.num_properties > 0 and guide_scale != 0.0):
+            return logits
+        oh = self._one_hot(tokens).detach().requires_grad_(True)
+        pred = self.predict_property(oh, pad_mask=pad_mask)
+        grad_oh = torch.autograd.grad(pred.sum(), oh, create_graph=False)[0].detach()
+        return logits + float(direction) * float(guide_scale) * grad_oh
 
     def sample(
         self,
@@ -226,55 +244,43 @@ class PCD(nn.Module):
         *,
         seed_tokens: Optional[torch.Tensor] = None,
         num_steps: int = 50,
-        step_size: Optional[float] = None,
-        noise_std: Optional[float] = None,
         guidance: bool = True,
         direction: float = 1.0,
         guide_scale: float = 1.0,
         pad_mask: Optional[torch.Tensor] = None,
         return_traj: bool = False,
     ):
-        """Langevin dynamics on free energy (+ optional property guidance).
-
-        ``dx = -∇F dt + σ dW``, with optional ``- direction * guide * ∇property``.
-        """
-        dt = float(self.langevin_step if step_size is None else step_size)
-        sigma = float(self.langevin_noise if noise_std is None else noise_std)
-
+        """Persistent-style multinomial Gibbs with optional property-biased visibles."""
         if seed_tokens is None:
-            # Start near the PCD fantasy manifold (random buffer rows) for de novo.
-            with torch.no_grad():
-                n = self.fantasy_v.shape[0]
-                idx = torch.randint(0, n, (batch_size,), device=self.device)
-                v0 = self._gibbs_k(self.fantasy_v[idx], k=max(self.n_gibbs, 1))
-            x = self._binary_to_seq(v0.float())
+            self._ensure_fantasy(batch_size, self.fantasy_tokens)
+            tokens = self.fantasy_tokens[:batch_size].clone()
             if pad_mask is None:
-                pad_mask = torch.ones(
-                    batch_size, self.seq_len, dtype=torch.bool, device=self.device
-                )
+                pad_mask = torch.ones(batch_size, self.seq_len, dtype=torch.bool, device=self.device)
         else:
-            seed_tokens = seed_tokens.to(self.device)
-            batch_size = seed_tokens.shape[0]
-            x = self._tokens_to_continuous(seed_tokens)
+            tokens = seed_tokens.long().to(self.device)
+            batch_size = tokens.shape[0]
             if pad_mask is None:
-                pad_mask = seed_tokens != 0
+                pad_mask = self._default_pad_mask(tokens)
+            else:
+                pad_mask = pad_mask.to(self.device).bool()
 
         traj = []
         for _ in range(max(int(num_steps), 1)):
-            with torch.enable_grad():
-                grad = self._energy_grad(
-                    x,
-                    pad_mask=pad_mask,
-                    guidance=guidance,
-                    direction=float(direction),
-                    guide_scale=float(guide_scale),
-                )
-            noise = torch.randn_like(x) * sigma
-            x = (x - dt * grad.detach() + noise).clamp(-1.0, 1.0)
+            with torch.no_grad():
+                h = self._sample_h_given_v(tokens, pad_mask=pad_mask)
+            logits = self._guided_visible_logits(
+                tokens,
+                h,
+                pad_mask=pad_mask,
+                guidance=guidance,
+                direction=float(direction),
+                guide_scale=float(guide_scale),
+            )
+            with torch.no_grad():
+                tokens = self._sample_v_given_h(h, pad_mask=pad_mask, logits=logits.detach())
             if return_traj:
-                traj.append(self._decode_tokens(x).detach())
+                traj.append(tokens.detach().clone())
 
-        tokens = self._decode_tokens(x)
         if return_traj:
             return tokens, torch.stack(traj, dim=0) if traj else tokens.unsqueeze(0)
         return tokens
@@ -285,19 +291,15 @@ class PCD(nn.Module):
         *,
         target_direction: str = "increase",
         num_steps: int = 50,
-        step_size: Optional[float] = None,
-        noise_std: Optional[float] = None,
         guide_scale: float = 1.0,
         pad_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Property-guided Langevin starting from seed sequences ``[B, L]``."""
+        """Property-guided multinomial Gibbs starting from seed sequences ``[B, L]``."""
         direction = 1.0 if target_direction == "increase" else -1.0
         return self.sample(
             batch_size=sequences.shape[0],
             seed_tokens=sequences,
             num_steps=num_steps,
-            step_size=step_size,
-            noise_std=noise_std,
             guidance=True,
             direction=direction,
             guide_scale=guide_scale,
@@ -309,7 +311,7 @@ class PCD(nn.Module):
 if __name__ == "__main__":
     torch.manual_seed(0)
     batch_size, seq_len, vocab_size = 8, 32, 7
-    model = PCD(vocab_size=vocab_size, seq_len=seq_len, device="cpu", buffer_size=32)
+    model = PCD(vocab_size=vocab_size, seq_len=seq_len, device="cpu", buffer_size=8, n_gibbs=1)
     sequences = torch.randint(1, vocab_size, (batch_size, seq_len))
     targets = torch.randn(batch_size, 1)
     mask = sequences != 0
@@ -321,6 +323,7 @@ if __name__ == "__main__":
 
     generated = model.sample(batch_size=4, num_steps=5, guidance=False)
     assert generated.shape == (4, seq_len)
+    assert (generated != 0).all()
 
     optimized = model.optimize(sequences[:4], target_direction="increase", num_steps=5)
     assert optimized.shape == (4, seq_len)

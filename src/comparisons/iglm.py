@@ -385,7 +385,7 @@ class IgLM(nn.Module):
 
     @torch.no_grad()
     def optimize(self, sequences, target_direction="increase", span_start=None, span_end=None,
-                 num_candidates=10, span_length=4):
+                 num_candidates=5, span_length=4):
         """
         Optimize sequences for desired properties:
         1. Generate many candidates via infilling
@@ -395,8 +395,8 @@ class IgLM(nn.Module):
         Args:
             sequences: [B, L] input sequences to optimize
             target_direction: "increase" or "decrease"
-            span_start: Start position of span to optimize (if None, choose automatically)
-            span_end: End position of span to optimize (if None, choose automatically)
+            span_start: Start of span to rewrite (default: quarter-span of length ``span_length``)
+            span_end: End of span to rewrite (default: quarter-span of length ``span_length``)
             num_candidates: Number of candidates to generate
             span_length: Length of span if positions not specified
         """

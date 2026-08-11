@@ -9,10 +9,7 @@ import torch.nn.functional as F
 
 
 class MPGD(nn.Module):
-    """MPGD guides diffusion sampling while projecting updates back onto a learned data manifold.
-
-    Originally manifold-preserving guided diffusion for pretrained image and latent diffusion models.
-    This RNA adaptation applies the approach to nucleotide sequences.
+    """Manifold Preserving Guided Diffusion for property-directed sequence design.
 
     Paper: Manifold Preserving Guided Diffusion (ICLR 2024)
     Github: https://github.com/KellyYutongHe/mpgd_pytorch
@@ -22,17 +19,24 @@ class MPGD(nn.Module):
         self,
         vocab_size: int = 7,
         seq_len: int = 150,
+        latent_dim: int = 64,
         hidden_dim: int = 128,
         num_layers: int = 2,
         num_heads: int = 4,
         dropout: float = 0.1,
         num_timesteps: int = 1000,
-        latent_dim: int = 32,
-        ae_weight: float = 0.1,
-        num_properties: int = 1,
+        pot_hidden: int = 512,
+        pot_layers: int = 4,
+        recon_p: float = 0.5,
+        bank_size: int = 8192,
+        scale: float = 0.2,
+        t0_frac: float = 0.8,
+        y_delta: float = 2.0,
+        eta: float = 1.0,
         device: Optional[Union[str, torch.device]] = None,
     ):
         super().__init__()
+        del hidden_dim, num_layers, num_heads, dropout  # API compat with other baselines
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         elif isinstance(device, str):
@@ -41,139 +45,82 @@ class MPGD(nn.Module):
 
         self.vocab_size = int(vocab_size)
         self.seq_len = int(seq_len)
-        self.hidden_dim = int(hidden_dim)
-        self.num_timesteps = int(num_timesteps)
         self.latent_dim = int(latent_dim)
-        self.ae_weight = float(ae_weight)
-        self.num_properties = int(num_properties)
+        self.num_timesteps = int(num_timesteps)
+        self.recon_p = float(recon_p)
+        self.bank_size = int(bank_size)
+        self.scale = float(scale)
+        self.t0_frac = float(t0_frac)
+        self.y_delta = float(y_delta)
+        self.eta = float(eta)
 
-        # Denoiser backbone over continuous one-hots.
-        self.input_proj = nn.Linear(self.vocab_size, hidden_dim)
-        self.pos_encoding = _SinusoidalPositionalEncoding(hidden_dim, seq_len + 100)
-        self.time_embedding = _TimeEmbedding(hidden_dim)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=4 * hidden_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.backbone = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.output_norm = nn.LayerNorm(hidden_dim)
-        self.noise_head = nn.Linear(hidden_dim, self.vocab_size)
+        self.ae = _ConvAE(vocab_size=self.vocab_size, length=self.seq_len, latent_dim=self.latent_dim)
+        self.eps_net = _EpsNet(self.latent_dim, hidden=pot_hidden, n_layers=pot_layers)
+        self.predictor = _PropertyNet(self.vocab_size, self.seq_len)
 
-        # Bottleneck AE for MPGD-AE manifold projection (clean continuous one-hots).
-        self.ae_enc = nn.Sequential(
-            nn.Linear(self.vocab_size, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, latent_dim),
-        )
-        self.ae_dec = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, self.vocab_size),
-        )
+        alphas_bar = _cosine_alphas_bar(self.num_timesteps)
+        self.register_buffer("alphas_bar", alphas_bar)
 
-        self.property_head = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 32),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, num_properties),
-        )
+        self.register_buffer("z_mu", torch.zeros(self.latent_dim))
+        self.register_buffer("z_sd", torch.ones(self.latent_dim))
+        self.register_buffer("_stats_count", torch.zeros((), dtype=torch.long))
+        self.register_buffer("_bank_z", torch.zeros(self.bank_size, self.latent_dim))
+        self.register_buffer("_bank_fill", torch.zeros((), dtype=torch.long))
+        self.register_buffer("_bank_ptr", torch.zeros((), dtype=torch.long))
 
-        betas = torch.linspace(1e-4, 0.02, self.num_timesteps)
-        alphas = 1.0 - betas
-        alpha_bars = torch.cumprod(alphas, dim=0)
-        self.register_buffer("betas", betas)
-        self.register_buffer("alphas", alphas)
-        self.register_buffer("alpha_bars", alpha_bars)
-
-        self._initialize_weights()
         self.to(self.device)
 
-    def _initialize_weights(self) -> None:
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LayerNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
+    # ------------------------------------------------------------------ stats / bank
+    def _update_latent_stats(self, z: torch.Tensor) -> None:
+        with torch.no_grad():
+            b = z.shape[0]
+            if b < 1:
+                return
+            batch_mu = z.mean(dim=0)
+            batch_var = z.var(dim=0, unbiased=False).clamp_min(0.0)
+            n0 = int(self._stats_count.item())
+            if n0 == 0:
+                self.z_mu.copy_(batch_mu)
+                self.z_sd.copy_(batch_var.sqrt().clamp_min(1e-6))
+                self._stats_count.fill_(b)
+                return
+            n1 = n0 + b
+            delta = batch_mu - self.z_mu
+            new_mu = self.z_mu + delta * (b / float(n1))
+            m2_0 = self.z_sd.square() * float(n0)
+            m2_1 = batch_var * float(b)
+            m2 = m2_0 + m2_1 + delta.square() * (float(n0) * float(b) / float(n1))
+            self.z_mu.copy_(new_mu)
+            self.z_sd.copy_((m2 / float(n1)).sqrt().clamp_min(1e-6))
+            self._stats_count.fill_(n1)
 
-    @staticmethod
-    def _tokens_to_continuous(token_ids: torch.Tensor, vocab_size: int) -> torch.Tensor:
-        return F.one_hot(token_ids.long(), num_classes=vocab_size).float() * 2.0 - 1.0
+    def _standardize(self, z: torch.Tensor) -> torch.Tensor:
+        return (z - self.z_mu) / self.z_sd.clamp_min(1e-6)
 
-    def _encode(
-        self,
-        x: torch.Tensor,
-        t: torch.Tensor,
-        pad_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        h = self.input_proj(x)
-        h = self.pos_encoding(h) + self.time_embedding(t).unsqueeze(1)
-        key_padding_mask = None if pad_mask is None else ~pad_mask.bool()
-        h = self.backbone(h, src_key_padding_mask=key_padding_mask)
-        return self.output_norm(h)
+    def _unstandardize(self, z: torch.Tensor) -> torch.Tensor:
+        return z * self.z_sd.clamp_min(1e-6) + self.z_mu
 
-    def _pool(self, h: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if pad_mask is None:
-            return h.mean(dim=1)
-        w = pad_mask.float().unsqueeze(-1)
-        return (h * w).sum(dim=1) / w.sum(dim=1).clamp(min=1.0)
+    def _push_bank(self, z_norm: torch.Tensor) -> None:
+        with torch.no_grad():
+            b = z_norm.shape[0]
+            if b < 1:
+                return
+            ptr = int(self._bank_ptr.item())
+            for i in range(b):
+                self._bank_z[ptr] = z_norm[i]
+                ptr = (ptr + 1) % self.bank_size
+            self._bank_ptr.fill_(ptr)
+            fill = int(self._bank_fill.item())
+            self._bank_fill.fill_(min(fill + b, self.bank_size))
 
-    def predict_noise(
-        self,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        pad_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return self.noise_head(self._encode(x_t, t, pad_mask=pad_mask))
+    def _sample_bank(self, batch_size: int) -> Optional[torch.Tensor]:
+        fill = int(self._bank_fill.item())
+        if fill < 1:
+            return None
+        idx = torch.randint(0, fill, (batch_size,), device=self._bank_z.device)
+        return self._bank_z[idx]
 
-    def predict_x0(
-        self,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        pad_mask: Optional[torch.Tensor] = None,
-        eps: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """DDIM / VP clean estimate ``x0|t`` from noisy ``x_t``."""
-        if eps is None:
-            eps = self.predict_noise(x_t, t, pad_mask=pad_mask)
-        a_bar = self.alpha_bars[t].view(-1, *([1] * (x_t.ndim - 1)))
-        return (x_t - torch.sqrt(1.0 - a_bar) * eps) / torch.sqrt(a_bar.clamp(min=1e-8))
-
-    def ae_project(self, x: torch.Tensor) -> torch.Tensor:
-        """MPGD-AE style reconstruction ``D(E(x))`` (position-wise bottleneck)."""
-        z = self.ae_enc(x)
-        return self.ae_dec(z)
-
-    def predict_property(
-        self,
-        x: torch.Tensor,
-        pad_mask: Optional[torch.Tensor] = None,
-        t: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Property from continuous ``x`` (uses ``t=0`` features by default)."""
-        if t is None:
-            t = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
-        h = self._encode(x, t, pad_mask=pad_mask)
-        return self.property_head(self._pool(h, pad_mask=pad_mask))
-
-    def add_noise(
-        self, x0: torch.Tensor, t: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        noise = torch.randn_like(x0)
-        a_bar = self.alpha_bars[t].view(-1, *([1] * (x0.ndim - 1)))
-        x_t = torch.sqrt(a_bar) * x0 + torch.sqrt(1.0 - a_bar) * noise
-        return x_t, noise
-
+    # ------------------------------------------------------------------ public API
     def compute_loss(
         self,
         x_0: torch.Tensor,
@@ -181,154 +128,145 @@ class MPGD(nn.Module):
         mask: Optional[torch.Tensor] = None,
         recon_weight: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Diffusion noise MSE (+ AE recon) and property MSE.
+        """AE CE + latent DDPM eps-MSE + property MSE.
+
+        Args:
+            x_0: token ids [B, L]
+            targets: property labels [B] or [B, P] (standardized by the dataloader)
+            mask: unused (latent MPGD); kept for API parity
+            recon_weight: weight on generative loss (AE + DDPM)
 
         Returns:
-            total_loss, gen_loss (noise[+AE]), property_loss, property_pred ``[B, P]``
+            total_loss, gen_loss, property_loss, property_pred [B, 1]
         """
+        del mask
         if x_0.dim() != 2:
             raise ValueError(f"Expected token ids [B, L], got shape {tuple(x_0.shape)}")
 
-        x0 = self._tokens_to_continuous(x_0, self.vocab_size)
-        b = x0.shape[0]
-        t = torch.randint(0, self.num_timesteps, (b,), device=x0.device)
-        x_t, noise = self.add_noise(x0, t)
+        b = x_0.shape[0]
+        logits, z = self.ae(x_0)
+        ae_loss = F.cross_entropy(logits, x_0)
 
-        eps_pred = self.predict_noise(x_t, t, pad_mask=mask)
-        if mask is not None:
-            m = mask.float().unsqueeze(-1)
-            noise_mse = ((eps_pred - noise) ** 2 * m).sum() / (
-                m.sum() * self.vocab_size
-            ).clamp(min=1.0)
-        else:
-            noise_mse = F.mse_loss(eps_pred, noise)
-
-        x0_hat_ae = self.ae_project(x0)
-        if mask is not None:
-            m = mask.float().unsqueeze(-1)
-            ae_recon = ((x0_hat_ae - x0) ** 2 * m).sum() / (
-                m.sum() * self.vocab_size
-            ).clamp(min=1.0)
-        else:
-            ae_recon = F.mse_loss(x0_hat_ae, x0)
-
-        gen_loss = noise_mse + self.ae_weight * ae_recon
-
-        prop_pred = self.predict_property(
-            x0, pad_mask=mask, t=torch.zeros(b, dtype=torch.long, device=x0.device)
-        )
+        # Property net on hard one-hot or AE soft recon.
         if targets is None:
-            prop_loss = torch.zeros((), device=x0.device)
+            prop_pred = torch.zeros(b, 1, device=x_0.device)
+            prop_loss = torch.zeros((), device=x_0.device)
         else:
             targets = targets.float()
-            if targets.dim() == 1:
-                targets = targets.unsqueeze(-1)
-            prop_loss = F.mse_loss(prop_pred, targets)
+            y_vec = targets.view(b, -1)[:, 0]
+            if self.training and torch.rand(()) < self.recon_p:
+                x_soft = torch.softmax(logits, dim=1)  # [B, V, L]
+            else:
+                x_soft = F.one_hot(x_0.long(), self.vocab_size).float().permute(0, 2, 1)
+            prop_pred = self.predictor(x_soft).view(b, 1)
+            prop_loss = F.mse_loss(prop_pred.view(-1), y_vec)
 
+        self._update_latent_stats(z.detach())
+        z_norm = self._standardize(z.detach())
+        self._push_bank(z_norm)
+
+        z0 = self._sample_bank(b)
+        if z0 is None:
+            z0 = z_norm
+        t = torch.randint(0, self.num_timesteps, (b,), device=x_0.device)
+        ab = self.alphas_bar[t].view(-1, 1)
+        noise = torch.randn_like(z0)
+        zt = ab.sqrt() * z0 + (1.0 - ab).sqrt() * noise
+        eps_pred = self.eps_net(zt, t.float())
+        ddpm_loss = F.mse_loss(eps_pred, noise)
+
+        gen_loss = ae_loss + ddpm_loss
         total = recon_weight * gen_loss + prop_loss
         return total, gen_loss, prop_loss, prop_pred
-
-    def _guidance_step(
-        self,
-        x0_hat: torch.Tensor,
-        *,
-        pad_mask: Optional[torch.Tensor],
-        direction: float,
-        guide_scale: float,
-        use_ae: bool,
-        a_bar_t: torch.Tensor,
-    ) -> torch.Tensor:
-        """MPGD update of ``x0|t``: ``x0 <- x0 - c_t ∇ L`` (optionally MPGD-AE)."""
-        x0 = x0_hat.detach().requires_grad_(True)
-        if use_ae:
-            # Grad through D(E(x0)) so update lies closer to the AE manifold.
-            x_for_loss = self.ae_project(x0)
-        else:
-            x_for_loss = x0
-        pred = self.predict_property(
-            x_for_loss,
-            pad_mask=pad_mask,
-            t=torch.zeros(x0.shape[0], dtype=torch.long, device=x0.device),
-        )
-        # Maximize property when direction > 0 => minimize L = -direction * pred.
-        loss = (-float(direction) * pred).sum()
-        grad = torch.autograd.grad(loss, x0, create_graph=False)[0]
-        # Scale similar to official ``scale / sqrt(a_bar)``.
-        step = float(guide_scale) / torch.sqrt(a_bar_t.view(-1, *([1] * (x0.ndim - 1))).clamp(min=1e-8))
-        return (x0.detach() - step * grad).clamp(-1.0, 1.0)
 
     def sample(
         self,
         batch_size: int,
         *,
         seed_tokens: Optional[torch.Tensor] = None,
+        seed_labels: Optional[torch.Tensor] = None,
         num_steps: int = 50,
         guidance: bool = True,
         direction: float = 1.0,
-        guide_scale: float = 1.0,
-        use_ae_proj: bool = True,
+        scale: Optional[float] = None,
+        t0_frac: Optional[float] = None,
+        y_delta: Optional[float] = None,
+        eta: Optional[float] = None,
         pad_mask: Optional[torch.Tensor] = None,
         return_traj: bool = False,
     ):
-        """MPGD shortcut sampling (Algorithm 1 + optional MPGD-AE)."""
-        # Official MPGD Algorithm 1: x_T ~ N(0, I), then denoise t = T .. 1.
-        # Seeds (if provided) only set batch size / length / pad mask — not the start state.
+        """SDEdit-seeded MPGD sampling with optional property guidance."""
+        del pad_mask
         if seed_tokens is None:
-            seq_len = self.seq_len
-            if pad_mask is None:
-                pad_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=self.device)
+            raise ValueError("MPGD mpgd_z sampling requires seed_tokens (SDEdit init).")
+        if guidance and seed_labels is None:
+            raise ValueError("Guided MPGD requires seed_labels for y* = y_seed + direction*y_delta.")
+
+        seed_tokens = seed_tokens.to(self.device)
+        batch_size = seed_tokens.shape[0]
+        scale = float(self.scale if scale is None else scale)
+        t0_frac = float(self.t0_frac if t0_frac is None else t0_frac)
+        y_delta = float(self.y_delta if y_delta is None else y_delta)
+        eta = float(self.eta if eta is None else eta)
+        ddim_steps = max(int(num_steps), 1)
+
+        self.ae.eval()
+        self.eps_net.eval()
+        self.predictor.eval()
+
+        z = self._standardize(self.ae.encode(seed_tokens))
+        if seed_labels is not None:
+            y_seed = seed_labels.float().view(-1).to(self.device)
+            y_target = y_seed + float(direction) * y_delta
         else:
-            seed_tokens = seed_tokens.to(self.device)
-            batch_size = seed_tokens.shape[0]
-            seq_len = seed_tokens.shape[1]
-            if pad_mask is None:
-                pad_mask = seed_tokens != 0
-        x = torch.randn(batch_size, seq_len, self.vocab_size, device=self.device)
+            y_target = None
 
-        steps = max(int(num_steps), 1)
-        # Uniform DDIM-like timestep grid.
-        times = torch.linspace(
-            self.num_timesteps - 1, 0, steps, device=self.device
-        ).long()
+        t0 = min(self.num_timesteps - 1, max(0, int(round(t0_frac * self.num_timesteps)) - 1))
+        ts = sorted(
+            {int(round(v)) for v in torch.linspace(t0, 0, ddim_steps).tolist()},
+            reverse=True,
+        )
+        ab_t0 = self.alphas_bar[t0]
+        z = ab_t0.sqrt() * z + (1.0 - ab_t0).sqrt() * torch.randn_like(z)
+
         traj = []
+        one = torch.ones((), device=self.device, dtype=self.alphas_bar.dtype)
+        for i, t in enumerate(ts):
+            ab = self.alphas_bar[t]
+            ab_prev = self.alphas_bar[ts[i + 1]] if i + 1 < len(ts) else one
+            tt = torch.full((batch_size,), float(t), device=self.device)
+            with torch.no_grad():
+                eps = self.eps_net(z, tt)
+            z0t = (z - (1.0 - ab).sqrt() * eps) / ab.sqrt().clamp_min(1e-8)
 
-        for i, t_val in enumerate(times):
-            t = torch.full((batch_size,), int(t_val.item()), device=self.device, dtype=torch.long)
-            a_bar_t = self.alpha_bars[t]
-            if i + 1 < len(times):
-                t_prev = int(times[i + 1].item())
-                a_bar_prev = self.alpha_bars[t_prev]
+            if guidance and scale != 0.0 and y_target is not None:
+                # Shortcut: grad only w.r.t. clean estimate (no backprop through eps).
+                c_t = scale / ab.sqrt().clamp_min(1e-8)
+                zg = z0t.detach().requires_grad_(True)
+                x_soft = torch.softmax(self.ae.decode(self._unstandardize(zg)), dim=1)
+                loss = 0.5 * ((self.predictor(x_soft) - y_target) ** 2).sum()
+                g = torch.autograd.grad(loss, zg, create_graph=False)[0]
+                z0t = zg.detach() - c_t * g
+
+            sigma = eta * ((1.0 - ab_prev) / (1.0 - ab).clamp_min(1e-8)).sqrt() * (
+                1.0 - ab / ab_prev.clamp_min(1e-8)
+            ).clamp_min(0.0).sqrt()
+            if eta > 0.0 and i + 1 < len(ts):
+                noise = torch.randn_like(z)
             else:
-                a_bar_prev = torch.ones((), device=self.device)
-
-            with torch.enable_grad():
-                eps = self.predict_noise(x, t, pad_mask=pad_mask)
-                x0_hat = self.predict_x0(x, t, pad_mask=pad_mask, eps=eps)
-                if guidance and self.num_properties > 0 and guide_scale != 0.0:
-                    x0_hat = self._guidance_step(
-                        x0_hat,
-                        pad_mask=pad_mask,
-                        direction=float(direction),
-                        guide_scale=float(guide_scale),
-                        use_ae=bool(use_ae_proj),
-                        a_bar_t=a_bar_t,
-                    )
-                    # Optional hard AE re-projection after the guided step (MPGD-AE).
-                    if use_ae_proj:
-                        x0_hat = self.ae_project(x0_hat).clamp(-1.0, 1.0)
-
-            # DDIM-style transition using the *original* noise prediction.
-            a_bar_prev_b = a_bar_prev if a_bar_prev.ndim > 0 else a_bar_prev.expand_as(a_bar_t)
-            a_bar_prev_b = a_bar_prev_b.view(-1, *([1] * (x.ndim - 1)))
-            x = (
-                torch.sqrt(a_bar_prev_b) * x0_hat
-                + torch.sqrt((1.0 - a_bar_prev_b).clamp(min=0.0)) * eps.detach()
-            ).clamp(-1.0, 1.0)
+                noise = torch.zeros_like(z)
+            z = (
+                ab_prev.sqrt() * z0t
+                + (1.0 - ab_prev - sigma**2).clamp_min(0.0).sqrt() * eps
+                + sigma * noise
+            )
             if return_traj:
-                traj.append(x.argmax(dim=-1).detach())
+                ids = self.ae.decode(self._unstandardize(z)).argmax(dim=1)
+                traj.append(ids.detach())
 
-        tokens = x.argmax(dim=-1)
+        tokens = self.ae.decode(self._unstandardize(z.detach())).argmax(dim=1)
         if return_traj:
+            traj.append(tokens.detach())
             return tokens, torch.stack(traj, dim=0) if traj else tokens.unsqueeze(0)
         return tokens
 
@@ -336,83 +274,160 @@ class MPGD(nn.Module):
         self,
         sequences: torch.Tensor,
         *,
+        seed_labels: torch.Tensor,
         target_direction: str = "increase",
         num_steps: int = 50,
-        guide_scale: float = 1.0,
-        use_ae_proj: bool = True,
+        scale: Optional[float] = None,
+        t0_frac: Optional[float] = None,
+        y_delta: Optional[float] = None,
+        eta: Optional[float] = None,
         pad_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Property-guided MPGD from pure noise (Algorithm 1); seeds set length/mask only."""
+        """SDEdit MPGD-LDM from seed sequences [B, L] and normalized seed labels [B]."""
         direction = 1.0 if target_direction == "increase" else -1.0
         return self.sample(
             batch_size=sequences.shape[0],
             seed_tokens=sequences,
+            seed_labels=seed_labels,
             num_steps=num_steps,
             guidance=True,
             direction=direction,
-            guide_scale=guide_scale,
-            use_ae_proj=use_ae_proj,
+            scale=scale,
+            t0_frac=t0_frac,
+            y_delta=y_delta,
+            eta=eta,
             pad_mask=pad_mask,
             return_traj=False,
         )
 
 
-class _SinusoidalPositionalEncoding(nn.Module):
-    def __init__(self, hidden_dim: int, max_len: int):
+# --------------------------------------------------------------------------- submodules
+def _cosine_alphas_bar(T: int) -> torch.Tensor:
+    """Nichol & Dhariwal cosine schedule; returns abar[t] for t=0..T-1."""
+    s = 0.008
+    steps = torch.arange(T + 1, dtype=torch.float64) / T
+    f = torch.cos((steps + s) / (1.0 + s) * math.pi / 2.0) ** 2
+    abar = f / f[0]
+    betas = (1.0 - abar[1:] / abar[:-1]).clamp(max=0.999)
+    return torch.cumprod(1.0 - betas, dim=0).float()
+
+
+class _ConvAE(nn.Module):
+    """1D-conv autoencoder over token sequences."""
+
+    def __init__(self, vocab_size: int = 7, length: int = 150, latent_dim: int = 64):
         super().__init__()
-        pe = torch.zeros(max_len, hidden_dim)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, hidden_dim, 2).float() * (-math.log(10000.0) / hidden_dim)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:, : x.size(1)]
-
-
-class _TimeEmbedding(nn.Module):
-    def __init__(self, hidden_dim: int):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+        self.vocab_size = int(vocab_size)
+        self.length = int(length)
+        self.latent_dim = int(latent_dim)
+        self.enc_conv = nn.Sequential(
+            nn.Conv1d(vocab_size, 32, 3, stride=2, padding=1),
             nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Conv1d(32, 64, 3, stride=2, padding=1),
+            nn.GELU(),
         )
-        self.hidden_dim = hidden_dim
+        enc_len = (length + 1) // 2
+        enc_len = (enc_len + 1) // 2
+        self.enc_len = enc_len
+        self.enc_proj = nn.Linear(64 * enc_len, latent_dim)
+        self.dec_proj = nn.Linear(latent_dim, 64 * enc_len)
+        self.dec_conv = nn.Sequential(
+            nn.ConvTranspose1d(64, 32, 3, stride=2, padding=1, output_padding=1),
+            nn.GELU(),
+            nn.ConvTranspose1d(32, vocab_size, 3, stride=2, padding=1, output_padding=0),
+        )
 
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        half = self.hidden_dim // 2
-        freqs = torch.exp(
-            -math.log(10000.0)
-            * torch.arange(half, device=t.device, dtype=torch.float32)
-            / half
+    def encode(self, ids: torch.Tensor) -> torch.Tensor:
+        onehot = F.one_hot(ids.long(), num_classes=self.vocab_size).float().transpose(1, 2)
+        return self.enc_proj(self.enc_conv(onehot).flatten(1))
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        h = self.dec_proj(z).view(z.size(0), 64, self.enc_len)
+        logits = self.dec_conv(h)
+        if logits.size(-1) < self.length:
+            logits = F.pad(logits, (0, self.length - logits.size(-1)))
+        elif logits.size(-1) > self.length:
+            logits = logits[..., : self.length]
+        return logits
+
+    def forward(self, ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        z = self.encode(ids)
+        return self.decode(z), z
+
+
+class _EpsNet(nn.Module):
+    """Residual MLP noise predictor over standardized latents."""
+
+    def __init__(self, dim: int, hidden: int = 512, n_layers: int = 4, t_dim: int = 128):
+        super().__init__()
+        self.t_dim = int(t_dim)
+        self.t_mlp = nn.Sequential(nn.Linear(t_dim, hidden), nn.SiLU(), nn.Linear(hidden, hidden))
+        self.inp = nn.Linear(dim, hidden)
+        self.blocks = nn.ModuleList(
+            nn.Sequential(nn.SiLU(), nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, hidden))
+            for _ in range(n_layers)
         )
-        args = t.float().unsqueeze(1) * freqs.unsqueeze(0)
-        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-        if self.hidden_dim % 2 == 1:
-            emb = F.pad(emb, (0, 1))
-        return self.mlp(emb)
+        self.out = nn.Sequential(nn.SiLU(), nn.Linear(hidden, dim))
+
+    def forward(self, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        h = self.inp(z) + self.t_mlp(_timestep_embedding(t, self.t_dim))
+        for blk in self.blocks:
+            h = h + blk(h)
+        return self.out(h)
+
+
+class _PropertyNet(nn.Module):
+    """Property head: soft one-hot [B, V, L] -> standardized scalar."""
+
+    def __init__(self, vocab_size: int, length: int, width: int = 64):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(vocab_size, width, 5, stride=2, padding=2),
+            nn.GELU(),
+            nn.Conv1d(width, width, 5, stride=2, padding=2),
+            nn.GELU(),
+            nn.Conv1d(width, width, 5, stride=2, padding=2),
+            nn.GELU(),
+        )
+        L = int(length)
+        for _ in range(3):
+            L = (L + 1) // 2
+        self.head = nn.Sequential(nn.Linear(width * L, 128), nn.GELU(), nn.Linear(128, 1))
+
+    def forward(self, x_soft: torch.Tensor) -> torch.Tensor:
+        return self.head(self.conv(x_soft).flatten(1)).squeeze(-1)
+
+
+def _timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device).float() / half)
+    args = t.float()[:, None] * freqs[None]
+    return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    batch_size, seq_len, vocab_size = 2, 32, 7
-    model = MPGD(vocab_size=vocab_size, seq_len=seq_len, num_timesteps=50, device="cpu")
+    batch_size, seq_len, vocab_size = 4, 32, 7
+    model = MPGD(
+        vocab_size=vocab_size,
+        seq_len=seq_len,
+        num_timesteps=50,
+        bank_size=64,
+        device="cpu",
+    )
     sequences = torch.randint(1, vocab_size, (batch_size, seq_len))
     targets = torch.randn(batch_size, 1)
-    mask = sequences != 0
-
-    total, gen, prop, pred = model.compute_loss(sequences, targets=targets, mask=mask)
+    for _ in range(4):
+        total, gen, prop, pred = model.compute_loss(sequences, targets=targets)
     assert total.ndim == 0 and pred.shape == (batch_size, 1)
-    assert gen.ndim == 0 and prop.ndim == 0
     assert torch.isfinite(total)
 
-    generated = model.sample(batch_size=batch_size, num_steps=5, guidance=False)
-    assert generated.shape == (batch_size, seq_len)
-
-    optimized = model.optimize(sequences, target_direction="increase", num_steps=5)
-    assert optimized.shape == sequences.shape
+    model.eval()
+    out = model.optimize(
+        sequences,
+        seed_labels=targets.view(-1),
+        target_direction="increase",
+        num_steps=5,
+    )
+    assert out.shape == sequences.shape
     print("MPGD unit tests passed.")

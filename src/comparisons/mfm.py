@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import math
-from typing import Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -11,10 +10,7 @@ from scipy.optimize import linear_sum_assignment
 
 
 class MFM(nn.Module):
-    """MFM learns manifold-aware flows between populations for guided sequence transport.
-
-    Originally developed for smooth interpolations on data manifolds. This RNA adaptation uses
-    property-defined sequence populations on nucleotide sequences.
+    """MFM transports sequences along property tertiles via latent metric flow matching.
 
     Paper: Metric Flow Matching for Smooth Interpolations on the Data Manifold (NeurIPS 2024)
     Github: https://github.com/kkapusniak/metric-flow-matching
@@ -24,18 +20,23 @@ class MFM(nn.Module):
         self,
         vocab_size: int = 7,
         seq_len: int = 150,
+        latent_dim: int = 64,
         hidden_dim: int = 128,
         num_layers: int = 2,
         num_heads: int = 4,
         dropout: float = 0.1,
         alpha: float = 1.0,
-        land_gamma: float = 0.5,
-        land_rho: float = 1.0,
-        geopath_weight: float = 0.1,
+        land_gamma: float = -1.0,
+        land_rho: float = 1e-2,
+        geopath_weight: float = 1.0,
+        n_metric_samples: int = 4096,
+        q_lo: float = 1.0 / 3.0,
+        q_hi: float = 2.0 / 3.0,
         num_properties: int = 1,
         device: Optional[Union[str, torch.device]] = None,
     ):
         super().__init__()
+        del num_layers, num_heads, dropout, num_properties  # API compat with other baselines
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         elif isinstance(device, str):
@@ -44,257 +45,289 @@ class MFM(nn.Module):
 
         self.vocab_size = int(vocab_size)
         self.seq_len = int(seq_len)
+        self.latent_dim = int(latent_dim)
         self.hidden_dim = int(hidden_dim)
         self.alpha = float(alpha)
-        self.land_gamma = float(land_gamma)
+        self.land_gamma = float(land_gamma)  # <0 => auto from train latents
         self.land_rho = float(land_rho)
         self.geopath_weight = float(geopath_weight)
-        self.num_properties = int(num_properties)
+        self.n_metric_samples = int(n_metric_samples)
+        self.q_lo = float(q_lo)
+        self.q_hi = float(q_hi)
+        self.use_geopath = self.alpha != 0.0
 
-        # ---- Flow network: v_theta(x_t, t, direction) ----
-        self.flow_input = nn.Linear(self.vocab_size, hidden_dim)
-        self.flow_pos = _SinusoidalPositionalEncoding(hidden_dim, seq_len + 100)
-        self.flow_time = _TimeEmbedding(hidden_dim)
-        self.flow_dir = nn.Linear(1, hidden_dim)
-        flow_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=4 * hidden_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.flow_backbone = nn.TransformerEncoder(flow_layer, num_layers=num_layers)
-        self.flow_norm = nn.LayerNorm(hidden_dim)
-        self.flow_head = nn.Linear(hidden_dim, self.vocab_size)
+        self.ae = _ConvAE(vocab_size=self.vocab_size, length=self.seq_len, latent_dim=self.latent_dim)
+        # Separate flow + geopath per direction.
+        self.flow_pos = _VelocityNet(self.latent_dim, hidden_dims=(256, 256, 256))
+        self.flow_neg = _VelocityNet(self.latent_dim, hidden_dims=(256, 256, 256))
+        if self.use_geopath:
+            self.geopath_pos = _GeoPathMLP(self.latent_dim, hidden_dims=(256, 256))
+            self.geopath_neg = _GeoPathMLP(self.latent_dim, hidden_dims=(256, 256))
+        else:
+            self.geopath_pos = None
+            self.geopath_neg = None
 
-        # ---- Geopath network: g_theta(x0, x1, t) ----
-        self.geo_input = nn.Linear(2 * self.vocab_size, hidden_dim)
-        self.geo_pos = _SinusoidalPositionalEncoding(hidden_dim, seq_len + 100)
-        self.geo_time = _TimeEmbedding(hidden_dim)
-        geo_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=4 * hidden_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.geo_backbone = nn.TransformerEncoder(geo_layer, num_layers=max(1, num_layers // 2))
-        self.geo_norm = nn.LayerNorm(hidden_dim)
-        self.geo_head = nn.Linear(hidden_dim, self.vocab_size)
+        # Latent standardization from full train encodings.
+        self.register_buffer("z_mu", torch.zeros(self.latent_dim))
+        self.register_buffer("z_sd", torch.ones(self.latent_dim))
+        self.register_buffer("_stats_count", torch.zeros((), dtype=torch.long))
 
-        # ---- Property head (joint, same as other baselines) ----
-        self.prop_pool_proj = nn.Linear(self.vocab_size, hidden_dim)
-        self.property_head = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 32),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, num_properties),
-        )
+        # Fixed train latent pool / tertile frames (set by build_train_latent_pool).
+        self._pool_z: Optional[torch.Tensor] = None
+        self._frame_low: Optional[torch.Tensor] = None
+        self._frame_mid: Optional[torch.Tensor] = None
+        self._frame_high: Optional[torch.Tensor] = None
+        self._land_gamma_resolved: Optional[float] = None
 
-        self._initialize_weights()
         self.to(self.device)
 
-    def _initialize_weights(self) -> None:
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LayerNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
+    # ------------------------------------------------------------------ AE / stats / pool
+    def _standardize(self, z: torch.Tensor) -> torch.Tensor:
+        return (z - self.z_mu) / self.z_sd.clamp_min(1e-6)
 
-    @staticmethod
-    def _tokens_to_continuous(token_ids: torch.Tensor, vocab_size: int) -> torch.Tensor:
-        return F.one_hot(token_ids.long(), num_classes=vocab_size).float() * 2.0 - 1.0
+    def _unstandardize(self, z: torch.Tensor) -> torch.Tensor:
+        return z * self.z_sd.clamp_min(1e-6) + self.z_mu
 
-    @staticmethod
-    def _gamma(t: torch.Tensor) -> torch.Tensor:
-        """Official gamma(t) on [0,1]: 1 - t^2 - (1-t)^2."""
-        return 1.0 - t.square() - (1.0 - t).square()
+    def _auto_land_gamma(self, latents: torch.Tensor, n_probe: int = 1024) -> float:
+        n = latents.shape[0]
+        idx = torch.randperm(n, device=latents.device)[: min(n_probe, n)]
+        d = torch.cdist(latents[idx], latents[idx])
+        iu = torch.triu_indices(d.size(0), d.size(0), offset=1, device=latents.device)
+        return float(d[iu[0], iu[1]].median().item()) * 0.5
 
-    @staticmethod
-    def _d_gamma(t: torch.Tensor) -> torch.Tensor:
-        """d/dt gamma(t) = 2*(-2t + 1) on [0,1]."""
-        return 2.0 * (-2.0 * t + 1.0)
+    def _partition_frames(
+        self, latents: torch.Tensor, labels: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Tertile split of latents by property labels."""
+        if latents.shape[0] < 6:
+            return None
+        y = labels.detach().float().cpu().numpy()
+        lo, hi = float(np.quantile(y, self.q_lo)), float(np.quantile(y, self.q_hi))
+        mask_low = y <= lo
+        mask_mid = (y > lo) & (y <= hi)
+        mask_high = y > hi
+        if mask_low.sum() < 1 or mask_mid.sum() < 1 or mask_high.sum() < 1:
+            return None
+        return latents[mask_low], latents[mask_mid], latents[mask_high]
 
-    @staticmethod
-    def _ot_couple(x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
-        """Permute ``x0`` to min-cost matching against ``x1`` (flat L2)."""
-        with torch.no_grad():
-            b = x0.shape[0]
-            a = x0.reshape(b, -1)
-            c = x1.reshape(b, -1)
-            cost = torch.cdist(a, c, p=2).detach().cpu().numpy()
-            row_ind, col_ind = linear_sum_assignment(cost)
-            inv = np.empty_like(col_ind)
-            inv[col_ind] = row_ind
-            return x0[torch.as_tensor(inv, device=x0.device)]
+    @torch.no_grad()
+    def build_train_latent_pool(self, loader, *, to_tokens) -> Dict[str, float]:
+        """Encode the full training loader once; set latent stats and tertile frames.
 
-    def geopath(
-        self,
-        x0: torch.Tensor,
-        x1: torch.Tensor,
-        t: torch.Tensor,
-        pad_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Geopath correction ``g_theta(x0,x1,t)`` with shape ``[B, L, V]``."""
-        t = t.reshape(-1).to(dtype=x0.dtype, device=x0.device)
-        h = self.geo_input(torch.cat([x0, x1], dim=-1))
-        h = self.geo_pos(h) + self.geo_time(t).unsqueeze(1)
-        key_padding_mask = None if pad_mask is None else ~pad_mask.bool()
-        h = self.geo_backbone(h, src_key_padding_mask=key_padding_mask)
-        return self.geo_head(self.geo_norm(h))
+        ``to_tokens`` maps a batch ``x`` tensor to token ids ``[B, L]``.
+        """
+        self.ae.eval()
+        zs: List[torch.Tensor] = []
+        ys: List[torch.Tensor] = []
+        for x, y in loader:
+            tokens = to_tokens(x).to(self.device)
+            z = self.ae.encode(tokens)
+            zs.append(z.detach().cpu())
+            ys.append(y.detach().float().view(-1).cpu())
+        latents = torch.cat(zs, dim=0)
+        labels = torch.cat(ys, dim=0)
+        z_mu = latents.mean(dim=0)
+        z_sd = latents.std(dim=0).clamp_min(1e-6)
+        self.z_mu.copy_(z_mu.to(self.device))
+        self.z_sd.copy_(z_sd.to(self.device))
+        self._stats_count.fill_(latents.shape[0])
 
-    def velocity(
-        self,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        *,
-        direction: float,
-        pad_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Direction-conditioned velocity ``v_theta(x_t, t, d)``."""
-        t = t.reshape(-1).to(dtype=x_t.dtype, device=x_t.device)
-        d = torch.full((x_t.shape[0], 1), float(direction), device=x_t.device, dtype=x_t.dtype)
-        h = self.flow_input(x_t)
-        h = self.flow_pos(h) + self.flow_time(t).unsqueeze(1) + self.flow_dir(d).unsqueeze(1)
-        key_padding_mask = None if pad_mask is None else ~pad_mask.bool()
-        h = self.flow_backbone(h, src_key_padding_mask=key_padding_mask)
-        return self.flow_head(self.flow_norm(h))
-
-    def predict_property(
-        self,
-        continuous_x: torch.Tensor,
-        pad_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        h = self.prop_pool_proj(continuous_x)
-        if pad_mask is None:
-            pooled = h.mean(dim=1)
+        z_norm = ((latents - z_mu) / z_sd).to(self.device)
+        labels_d = labels.to(self.device)
+        frames = self._partition_frames(z_norm, labels_d)
+        if frames is None:
+            raise RuntimeError("MFM tertile partition failed on the full train latent pool.")
+        self._frame_low, self._frame_mid, self._frame_high = frames
+        self._pool_z = z_norm
+        if self.land_gamma > 0:
+            self._land_gamma_resolved = float(self.land_gamma)
         else:
-            w = pad_mask.float().unsqueeze(-1)
-            pooled = (h * w).sum(dim=1) / w.sum(dim=1).clamp(min=1.0)
-        return self.property_head(pooled)
+            self._land_gamma_resolved = self._auto_land_gamma(z_norm)
+        return {
+            "n_train": float(latents.shape[0]),
+            "n_low": float(self._frame_low.shape[0]),
+            "n_mid": float(self._frame_mid.shape[0]),
+            "n_high": float(self._frame_high.shape[0]),
+            "land_gamma": float(self._land_gamma_resolved),
+        }
+
+    def has_latent_pool(self) -> bool:
+        return (
+            self._pool_z is not None
+            and self._frame_low is not None
+            and self._frame_mid is not None
+            and self._frame_high is not None
+        )
+
+    @staticmethod
+    def _sample_frame(frame: torch.Tensor, batch_size: int) -> torch.Tensor:
+        n = frame.shape[0]
+        if n <= 0:
+            raise ValueError("empty frame")
+        if n <= batch_size:
+            idx = torch.randint(0, n, (batch_size,), device=frame.device)
+        else:
+            idx = torch.randperm(n, device=frame.device)[:batch_size]
+        return frame[idx]
+
+    @staticmethod
+    def _ot_couple(x0: torch.Tensor, x1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Exact OT minibatch plan."""
+        with torch.no_grad():
+            cost = torch.cdist(x0, x1, p=2).detach().cpu().numpy()
+            row_ind, col_ind = linear_sum_assignment(cost)
+            # torchcfm sample_plan returns reordered (x0[i], x1[pi(i)]); keep both aligned.
+            return x0[torch.as_tensor(row_ind, device=x0.device)], x1[
+                torch.as_tensor(col_ind, device=x1.device)
+            ]
+
+    # ------------------------------------------------------------------ Metric path
+    @staticmethod
+    def _gamma(t: torch.Tensor, t_min: float, t_max: float) -> torch.Tensor:
+        span = max(t_max - t_min, 1e-8)
+        return 1.0 - ((t - t_min) / span) ** 2 - ((t_max - t) / span) ** 2
+
+    @staticmethod
+    def _d_gamma(t: torch.Tensor, t_min: float, t_max: float) -> torch.Tensor:
+        span = max(t_max - t_min, 1e-8)
+        return 2.0 * (-2.0 * t + t_max + t_min) / (span**2)
 
     def _sample_path(
         self,
         x0: torch.Tensor,
         x1: torch.Tensor,
-        pad_mask: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample (t, x_t, u_t, g) under MetricFlowMatcher (t_min=0, t_max=1)."""
+        geopath: Optional[nn.Module],
+        t_min: float,
+        t_max: float,
+        *,
+        training_geopath: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(t, x_t, u_t)`` on ``[t_min, t_max]`` (sigma=0 CondOT)."""
         b = x0.shape[0]
-        t = torch.rand(b, device=x0.device, dtype=x0.dtype)
+        t = torch.rand(b, device=x0.device, dtype=x0.dtype) * (t_max - t_min) + t_min
         t_ = _pad_t_like_x(t, x0)
-        g = self.geopath(x0, x1, t, pad_mask=pad_mask)
-        gamma = _pad_t_like_x(self._gamma(t), x0)
-        d_gamma = _pad_t_like_x(self._d_gamma(t), x0)
-        mu = (1.0 - t_) * x0 + t_ * x1 + self.alpha * gamma * g
-        # Probabilistic path: optional small isotropic noise (sigma=0 CondOT).
-        xt = mu
-        ut = (x1 - x0) + self.alpha * d_gamma * g
-        return t, xt, ut, g
+        span = max(t_max - t_min, 1e-8)
+        mu = ((t_max - t_) / span) * x0 + ((t_ - t_min) / span) * x1
+        ut = (x1 - x0) / span
+        if self.use_geopath and geopath is not None:
+            g = geopath(x0, x1, t)
+            if training_geopath:
+                # LAND objective needs grads through g -> ut.
+                pass
+            gamma = _pad_t_like_x(self._gamma(t, t_min, t_max), x0)
+            d_gamma = _pad_t_like_x(self._d_gamma(t, t_min, t_max), x0)
+            mu = mu + gamma * g
+            ut = ut + d_gamma * g
+        return t, mu, ut
 
-    def _masked_mse(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        pad_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        err = (pred - target).square()
-        if pad_mask is None:
-            return err.mean()
-        m = pad_mask.float().unsqueeze(-1)
-        return (err * m).sum() / (m.sum() * pred.shape[-1]).clamp(min=1.0)
-
-    def _land_velocity_loss(
+    def _land_loss(
         self,
         xt: torch.Tensor,
         ut: torch.Tensor,
         ref_samples: torch.Tensor,
+        gamma: float,
     ) -> torch.Tensor:
-        """Mean squared LAND speed of ``ut`` at ``xt`` (geopath regularizer)."""
-        xt_f = xt.reshape(xt.shape[0], -1)
-        ut_f = ut.reshape(ut.shape[0], -1)
-        ref_f = ref_samples.reshape(ref_samples.shape[0], -1)
-        # Cap reference size for stability / cost.
-        n_ref = min(ref_f.shape[0], 64)
-        if ref_f.shape[0] > n_ref:
-            idx = torch.randperm(ref_f.shape[0], device=ref_f.device)[:n_ref]
-            ref_f = ref_f[idx]
-        m_inv = _land_metric_diag(xt_f, ref_f.detach(), self.land_gamma, self.land_rho)
-        # Mean over dims (not sum): keeps the regularizer scale-stable for large L*V.
-        speed2 = ((ut_f**2) * m_inv).mean(dim=-1)
-        return speed2.mean()
+        """Mean LAND tangential energy ``sum_d u_d^2 / M_dd``."""
+        n_ref = min(ref_samples.shape[0], self.n_metric_samples)
+        ref = ref_samples
+        if ref.shape[0] > n_ref:
+            idx = torch.randperm(ref.shape[0], device=ref.device)[:n_ref]
+            ref = ref[idx]
+        m_inv = _land_metric_diag(xt, ref.detach(), gamma, self.land_rho)
+        return ((ut**2) * m_inv).sum(dim=-1).mean()
 
-    def _partition_populations(
+    def _pair_losses(
         self,
-        x: torch.Tensor,
-        y: torch.Tensor,
-        pad_mask: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Split continuous sequences into low / high property groups."""
-        yf = y.float().view(-1)
-        med = yf.median()
-        low_idx = torch.nonzero(yf <= med, as_tuple=False).view(-1)
-        high_idx = torch.nonzero(yf >= med, as_tuple=False).view(-1)
-        # Drop median ties from one side if both sides grabbed them.
-        if low_idx.numel() + high_idx.numel() > yf.numel():
-            low_idx = torch.nonzero(yf < med, as_tuple=False).view(-1)
-            high_idx = torch.nonzero(yf > med, as_tuple=False).view(-1)
-            eq = torch.nonzero(yf == med, as_tuple=False).view(-1)
-            # Assign ties round-robin to balance.
-            for i, j in enumerate(eq):
-                if i % 2 == 0:
-                    low_idx = torch.cat([low_idx, j.view(1)])
-                else:
-                    high_idx = torch.cat([high_idx, j.view(1)])
-
-        if low_idx.numel() < 1 or high_idx.numel() < 1:
-            # Degenerate labels: random half split.
-            perm = torch.randperm(x.shape[0], device=x.device)
-            mid = max(x.shape[0] // 2, 1)
-            low_idx, high_idx = perm[:mid], perm[mid:]
-            if high_idx.numel() < 1:
-                high_idx = low_idx.clone()
-
-        # Equalize counts for OT (pair min size).
-        n = int(min(low_idx.numel(), high_idx.numel()))
-        low_idx = low_idx[:n]
-        high_idx = high_idx[:n]
-        x_low, x_high = x[low_idx], x[high_idx]
-        m_low = pad_mask[low_idx] if pad_mask is not None else None
-        m_high = pad_mask[high_idx] if pad_mask is not None else None
-        return x_low, x_high, m_low, m_high
-
-    def _directional_flow_loss(
-        self,
-        x0: torch.Tensor,
-        x1: torch.Tensor,
+        frames_in_order: Sequence[torch.Tensor],
         *,
-        direction: float,
-        pad_mask: Optional[torch.Tensor],
+        flow_net: nn.Module,
+        geopath: Optional[nn.Module],
         ref_samples: torch.Tensor,
+        batch_size: int,
+        land_gamma: float,
+        train_geopath: bool = True,
+        train_flow: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """OT-coupled Metric CFM loss (+ LAND geopath regularizer) for one direction."""
-        x0 = self._ot_couple(x0, x1)
-        t, xt, ut, _g = self._sample_path(x0, x1, pad_mask)
-        vt = self.velocity(xt, t, direction=direction, pad_mask=pad_mask)
-        flow_loss = self._masked_mse(vt, ut.detach() if self.geopath_weight > 0 else ut, pad_mask)
-        # Geopath should reduce LAND tangential velocity; keep flow target stable.
-        if self.alpha != 0.0 and self.geopath_weight > 0.0:
-            geo_loss = self._land_velocity_loss(xt, ut, ref_samples)
-        else:
-            geo_loss = torch.zeros((), device=x0.device)
-        return flow_loss, geo_loss
+        """Adjacent-frame OT MFM losses for one direction."""
+        timesteps = torch.linspace(0.0, 1.0, len(frames_in_order)).tolist()
+        flow_losses: List[torch.Tensor] = []
+        geo_losses: List[torch.Tensor] = []
+        for i in range(len(frames_in_order) - 1):
+            x0 = self._sample_frame(frames_in_order[i], batch_size)
+            x1 = self._sample_frame(frames_in_order[i + 1], batch_size)
+            x0, x1 = self._ot_couple(x0, x1)
+            t_min, t_max = float(timesteps[i]), float(timesteps[i + 1])
 
+            if train_geopath and self.use_geopath and geopath is not None and self.geopath_weight > 0.0:
+                _t, xt_g, ut_g = self._sample_path(
+                    x0, x1, geopath, t_min, t_max, training_geopath=True
+                )
+                geo_losses.append(self._land_loss(xt_g, ut_g, ref_samples, land_gamma))
+
+            if train_flow:
+                t, xt, ut = self._sample_path(
+                    x0, x1, geopath, t_min, t_max, training_geopath=False
+                )
+                if self.use_geopath and geopath is not None:
+                    ut = ut.detach()
+                    xt = xt.detach()
+                vt = flow_net(t, xt)
+                flow_losses.append(F.mse_loss(vt, ut))
+
+        if flow_losses:
+            flow = sum(flow_losses) / len(flow_losses)
+        else:
+            flow = torch.zeros((), device=ref_samples.device)
+        if geo_losses:
+            geo = sum(geo_losses) / len(geo_losses)
+        else:
+            geo = torch.zeros((), device=ref_samples.device)
+        return flow, geo
+
+    def ae_loss(self, tokens: torch.Tensor) -> torch.Tensor:
+        logits, _z = self.ae(tokens)
+        return F.cross_entropy(logits, tokens)
+
+    def d2d_loss(
+        self,
+        *,
+        batch_size: int,
+        train_geopath: bool,
+        train_flow: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Flow/geopath losses on the fixed full-train tertile pool. Returns flow, geo, total."""
+        if not self.has_latent_pool():
+            raise RuntimeError("MFM d2d_loss requires build_train_latent_pool() first.")
+        assert self._pool_z is not None and self._land_gamma_resolved is not None
+        assert self._frame_low is not None and self._frame_mid is not None and self._frame_high is not None
+        land_gamma = float(self._land_gamma_resolved)
+        pair_bs = min(int(batch_size), 128)
+        flow_pos, geo_pos = self._pair_losses(
+            [self._frame_low, self._frame_mid, self._frame_high],
+            flow_net=self.flow_pos,
+            geopath=self.geopath_pos,
+            ref_samples=self._pool_z,
+            batch_size=pair_bs,
+            land_gamma=land_gamma,
+            train_geopath=train_geopath,
+            train_flow=train_flow,
+        )
+        flow_neg, geo_neg = self._pair_losses(
+            [self._frame_high, self._frame_mid, self._frame_low],
+            flow_net=self.flow_neg,
+            geopath=self.geopath_neg,
+            ref_samples=self._pool_z,
+            batch_size=pair_bs,
+            land_gamma=land_gamma,
+            train_geopath=train_geopath,
+            train_flow=train_flow,
+        )
+        flow_loss = 0.5 * (flow_pos + flow_neg)
+        geo_loss = 0.5 * (geo_pos + geo_neg)
+        total = flow_loss + self.geopath_weight * geo_loss
+        return flow_loss, geo_loss, total
+
+    # ------------------------------------------------------------------ public API
     def compute_loss(
         self,
         x_0: torch.Tensor,
@@ -302,94 +335,57 @@ class MFM(nn.Module):
         mask: Optional[torch.Tensor] = None,
         recon_weight: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Population Metric-CFM (both directions) + property MSE.
-
-        Args:
-            x_0: token ids ``[B, L]``
-            targets: property labels ``[B]`` or ``[B, P]`` (required for split)
-            mask: bool pad mask True=valid ``[B, L]``
-            recon_weight: weight on generative (flow + geopath) loss
-
-        Returns:
-            total_loss, gen_loss, property_loss, property_pred ``[B, P]``
-        """
+        """Eval helper: AE CE (+ d2d loss if the train latent pool is built). Property loss is 0."""
+        del mask, targets
         if x_0.dim() != 2:
             raise ValueError(f"Expected token ids [B, L], got shape {tuple(x_0.shape)}")
-        if targets is None:
-            raise ValueError("MFM requires property targets to partition populations.")
-
-        x = self._tokens_to_continuous(x_0, self.vocab_size)
-        targets = targets.float()
-        y_vec = targets.view(targets.shape[0], -1)[:, 0]
-
-        x_low, x_high, m_low, m_high = self._partition_populations(x, y_vec, mask)
-        # Shared pad mask for paired minibatches (intersection of valid positions).
-        if m_low is not None and m_high is not None:
-            pair_mask = m_low & m_high
-        else:
-            pair_mask = m_low if m_low is not None else m_high
-
-        ref = torch.cat([x_low, x_high], dim=0)
-        flow_fwd, geo_fwd = self._directional_flow_loss(
-            x_low, x_high, direction=1.0, pad_mask=pair_mask, ref_samples=ref
-        )
-        flow_bwd, geo_bwd = self._directional_flow_loss(
-            x_high, x_low, direction=-1.0, pad_mask=pair_mask, ref_samples=ref
-        )
-        flow_loss = 0.5 * (flow_fwd + flow_bwd)
-        geo_loss = 0.5 * (geo_fwd + geo_bwd)
-        gen_loss = flow_loss + self.geopath_weight * geo_loss
-
-        prop_pred = self.predict_property(x, pad_mask=mask)
-        if targets.dim() == 1:
-            targets = targets.unsqueeze(-1)
-        prop_loss = F.mse_loss(prop_pred, targets)
-
+        b = x_0.shape[0]
+        ae_loss = self.ae_loss(x_0)
+        flow_loss = torch.zeros((), device=x_0.device)
+        geo_loss = torch.zeros((), device=x_0.device)
+        if self.has_latent_pool():
+            flow_loss, geo_loss, _ = self.d2d_loss(
+                batch_size=b, train_geopath=True, train_flow=True
+            )
+        gen_loss = ae_loss + flow_loss + self.geopath_weight * geo_loss
+        prop_loss = torch.zeros((), device=x_0.device)
+        prop_pred = torch.zeros(b, 1, device=x_0.device)
         total = recon_weight * gen_loss + prop_loss
         return total, gen_loss, prop_loss, prop_pred
 
     @torch.no_grad()
-    def _decode_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        return x.argmax(dim=-1)
-
     def sample(
         self,
         batch_size: int,
         *,
         seed_tokens: Optional[torch.Tensor] = None,
         direction: float = 1.0,
-        num_steps: int = 50,
+        num_steps: int = 100,
         pad_mask: Optional[torch.Tensor] = None,
         return_traj: bool = False,
     ):
-        """Euler integrate ``dx/dt = v_theta(x,t,direction)`` on ``t in [0,1]``.
-
-        ``direction=+1`` maximizes property (low->high flow); ``-1`` minimizes.
-        """
+        """Encode -> standardize -> Euler 0->1 with direction flow -> decode."""
+        del pad_mask
         if seed_tokens is None:
-            x = torch.randn(batch_size, self.seq_len, self.vocab_size, device=self.device)
-            if pad_mask is None:
-                pad_mask = torch.ones(
-                    batch_size, self.seq_len, dtype=torch.bool, device=self.device
-                )
-        else:
-            seed_tokens = seed_tokens.to(self.device)
-            batch_size = seed_tokens.shape[0]
-            x = self._tokens_to_continuous(seed_tokens, self.vocab_size)
-            if pad_mask is None:
-                pad_mask = seed_tokens != 0
+            raise ValueError("MFM d2d sampling requires seed_tokens (data-to-data).")
+        seed_tokens = seed_tokens.to(self.device)
+        batch_size = seed_tokens.shape[0]
+        flow_net = self.flow_pos if float(direction) >= 0.0 else self.flow_neg
+        flow_net.eval()
+        self.ae.eval()
 
+        z = self._standardize(self.ae.encode(seed_tokens))
         dt = 1.0 / max(int(num_steps), 1)
         traj = []
         for i in range(max(int(num_steps), 1)):
-            t_val = float(i) * dt
-            t = torch.full((batch_size,), t_val, device=self.device, dtype=x.dtype)
-            v = self.velocity(x, t, direction=float(direction), pad_mask=pad_mask)
-            x = (x + dt * v).clamp(-1.0, 1.0)
+            t = torch.full((batch_size,), float(i) * dt, device=self.device, dtype=z.dtype)
+            v = flow_net(t, z)
+            z = z + dt * v
             if return_traj:
-                traj.append(self._decode_tokens(x).detach())
+                ids = self.ae.decode(self._unstandardize(z)).argmax(dim=1)
+                traj.append(ids.detach())
 
-        tokens = self._decode_tokens(x)
+        tokens = self.ae.decode(self._unstandardize(z)).argmax(dim=1)
         if return_traj:
             return tokens, torch.stack(traj, dim=0) if traj else tokens.unsqueeze(0)
         return tokens
@@ -399,10 +395,10 @@ class MFM(nn.Module):
         sequences: torch.Tensor,
         *,
         target_direction: str = "increase",
-        num_steps: int = 50,
+        num_steps: int = 100,
         pad_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Integrate the population flow starting from seed sequences ``[B, L]``."""
+        """Integrate the direction-specific latent flow from seed sequences ``[B, L]``."""
         direction = 1.0 if target_direction == "increase" else -1.0
         return self.sample(
             batch_size=sequences.shape[0],
@@ -414,8 +410,100 @@ class MFM(nn.Module):
         )
 
 
+# --------------------------------------------------------------------------- helpers / submodules
+class _ConvAE(nn.Module):
+    """1D-conv autoencoder over token sequences."""
+
+    def __init__(self, vocab_size: int = 7, length: int = 150, latent_dim: int = 64):
+        super().__init__()
+        self.vocab_size = int(vocab_size)
+        self.length = int(length)
+        self.latent_dim = int(latent_dim)
+        self.enc_conv = nn.Sequential(
+            nn.Conv1d(vocab_size, 32, 3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv1d(32, 64, 3, stride=2, padding=1),
+            nn.GELU(),
+        )
+        enc_len = (length + 1) // 2
+        enc_len = (enc_len + 1) // 2
+        self.enc_len = enc_len
+        self.enc_proj = nn.Linear(64 * enc_len, latent_dim)
+        self.dec_proj = nn.Linear(latent_dim, 64 * enc_len)
+        self.dec_conv = nn.Sequential(
+            nn.ConvTranspose1d(64, 32, 3, stride=2, padding=1, output_padding=1),
+            nn.GELU(),
+            nn.ConvTranspose1d(32, vocab_size, 3, stride=2, padding=1, output_padding=0),
+        )
+
+    def encode(self, ids: torch.Tensor) -> torch.Tensor:
+        onehot = F.one_hot(ids.long(), num_classes=self.vocab_size).float().transpose(1, 2)
+        return self.enc_proj(self.enc_conv(onehot).flatten(1))
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        h = self.dec_proj(z).view(z.size(0), 64, self.enc_len)
+        logits = self.dec_conv(h)
+        if logits.size(-1) < self.length:
+            logits = F.pad(logits, (0, self.length - logits.size(-1)))
+        elif logits.size(-1) > self.length:
+            logits = logits[..., : self.length]
+        return logits
+
+    def forward(self, ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        z = self.encode(ids)
+        return self.decode(z), z
+
+
+class _SimpleDenseNet(nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        target_size: int,
+        hidden_dims: Sequence[int] = (256, 256),
+        activation: str = "silu",
+    ):
+        super().__init__()
+        act = nn.SiLU if activation == "silu" else nn.GELU
+        dims = [input_size, *list(hidden_dims), target_size]
+        layers: List[nn.Module] = []
+        for i in range(len(dims) - 2):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            layers.append(act())
+        layers.append(nn.Linear(dims[-2], dims[-1]))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
+
+
+class _VelocityNet(nn.Module):
+    """Zip ``VelocityNet``: MLP on ``concat(t, z)``."""
+
+    def __init__(self, dim: int, hidden_dims: Sequence[int] = (256, 256, 256)):
+        super().__init__()
+        self.net = _SimpleDenseNet(dim + 1, dim, hidden_dims=hidden_dims)
+
+    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if t.dim() < 1 or t.shape[0] != x.shape[0]:
+            t = t.repeat(x.shape[0])[:, None]
+        if t.dim() < 2:
+            t = t[:, None]
+        return self.net(torch.cat([t, x], dim=-1))
+
+
+class _GeoPathMLP(nn.Module):
+    """Zip ``GeoPathMLP`` with ``time_geopath=False``."""
+
+    def __init__(self, input_dim: int, hidden_dims: Sequence[int] = (256, 256)):
+        super().__init__()
+        self.net = _SimpleDenseNet(2 * input_dim, input_dim, hidden_dims=hidden_dims)
+
+    def forward(self, x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        del t
+        return self.net(torch.cat([x0, x1], dim=-1))
+
+
 def _pad_t_like_x(t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """Broadcast scalar/batch times ``t`` to ``x``'s trailing dims."""
     if t.ndim == 0:
         t = t.view(1).expand(x.shape[0])
     while t.ndim < x.ndim:
@@ -429,81 +517,33 @@ def _land_metric_diag(
     gamma: float,
     rho: float,
 ) -> torch.Tensor:
-    """Diagonal LAND inverse-metric at ``x`` using reference ``samples``.
-
-    Args:
-        x: ``[B, D]``
-        samples: ``[N, D]``
-        gamma, rho: LAND bandwidth / ridge.
-
-    Returns:
-        ``M_inv`` of shape ``[B, D]`` (diagonal inverse metric).
-    """
-    # weights[b,n] = exp(-||x_b - s_n||^2 / (2 gamma^2))
+    """Diagonal LAND inverse-metric."""
     pairwise_sq = ((x[:, None, :] - samples[None, :, :]) ** 2).sum(dim=-1)
     weights = torch.exp(-pairwise_sq / (2.0 * gamma * gamma + 1e-12))
     differences = samples[None, :, :] - x[:, None, :]
-    squared = differences**2
-    m_diag = torch.einsum("bn,bnd->bd", weights, squared) + float(rho)
+    m_diag = torch.einsum("bn,bnd->bd", weights, differences**2) + float(rho)
     return 1.0 / m_diag.clamp(min=1e-8)
-
-
-class _SinusoidalPositionalEncoding(nn.Module):
-    def __init__(self, hidden_dim: int, max_len: int):
-        super().__init__()
-        pe = torch.zeros(max_len, hidden_dim)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, hidden_dim, 2).float() * (-math.log(10000.0) / hidden_dim)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:, : x.size(1)]
-
-
-class _TimeEmbedding(nn.Module):
-    def __init__(self, hidden_dim: int):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.hidden_dim = hidden_dim
-
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        """Sinusoidal time embedding; ``t`` shape ``[B]`` in [0,1]."""
-        half = self.hidden_dim // 2
-        freqs = torch.exp(
-            -math.log(10000.0)
-            * torch.arange(0, half, device=t.device, dtype=t.dtype)
-            / max(half, 1)
-        )
-        args = t.float().unsqueeze(1) * freqs.unsqueeze(0)
-        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-        if emb.shape[-1] < self.hidden_dim:
-            emb = F.pad(emb, (0, self.hidden_dim - emb.shape[-1]))
-        return self.mlp(emb.to(dtype=next(self.parameters()).dtype))
 
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    batch_size, seq_len, vocab_size = 8, 32, 7
+    vocab_size, seq_len, b = 7, 48, 32
     model = MFM(vocab_size=vocab_size, seq_len=seq_len, device="cpu")
-    sequences = torch.randint(1, vocab_size, (batch_size, seq_len))
-    targets = torch.randn(batch_size, 1)
-    mask = sequences != 0
+    tokens = torch.randint(1, vocab_size, (b, seq_len))
+    y = torch.linspace(-1, 1, b)
+    # Fake full-train pool: encode once then set frames via build_train_latent_pool API.
+    class _Loader:
+        def __iter__(self):
+            yield tokens, y
 
-    total, gen, prop, pred = model.compute_loss(sequences, targets=targets, mask=mask)
-    assert total.ndim == 0 and pred.shape == (batch_size, 1)
-    assert torch.isfinite(total), total
-
-    generated = model.sample(batch_size=4, num_steps=5, direction=1.0)
-    assert generated.shape == (4, seq_len)
-
-    optimized = model.optimize(sequences[:4], target_direction="increase", num_steps=5)
-    assert optimized.shape == (4, seq_len)
+    info = model.build_train_latent_pool(_Loader(), to_tokens=lambda x: x)
+    assert info["n_train"] == float(b)
+    assert model.has_latent_pool()
+    ae = model.ae_loss(tokens)
+    flow, geo, total = model.d2d_loss(batch_size=16, train_geopath=True, train_flow=True)
+    assert ae.ndim == 0 and total.ndim == 0
+    out = model.optimize(tokens[:4], target_direction="increase", num_steps=5)
+    assert out.shape == (4, seq_len)
+    out_neg = model.optimize(tokens[:4], target_direction="decrease", num_steps=5)
+    assert out_neg.shape == (4, seq_len)
     print("MFM unit tests passed.")

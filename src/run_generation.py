@@ -13,8 +13,7 @@ Examples:
 
   python src/run_generation.py \\
     --dataset OpenVaccine --method guided --model DiffAb \\
-    --experiment pos_guided --seed 1 --direction 1 \\
-    --num_steps 10 --forward_steps 100 --num_candidates 1
+    --experiment pos_guided --seed 1 --direction 1
 """
 
 from __future__ import annotations
@@ -483,6 +482,7 @@ def optimize_baseline_batch(
     *,
     args,
     device: str,
+    seed_labels: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one batch of seed-started property optimization. Returns tokens ``[B, L]``."""
     starts = starts.to(device)
@@ -490,92 +490,39 @@ def optimize_baseline_batch(
     target = direction_to_target(args.direction)
 
     if model_name == "DiffAb":
-        traj = model.optimize(
-            starts,
-            device=device,
-            target_direction=target,
-            num_candidates=args.num_candidates,
-            forward_steps=args.forward_steps,
-            mask=mask,
-        )
-        # optimize returns full trajectory [T, B, L]; take the final sequences.
+        traj = model.optimize(starts, device=device, target_direction=target, mask=mask)
         return traj[-1].detach().cpu()
 
     if model_name == "IgLM":
-        seq_len = starts.shape[1]
-        return model.optimize(
-            starts,
-            target_direction=target,
-            span_start=0,
-            span_end=seq_len - 1,
-            num_candidates=args.num_candidates,
-        ).detach().cpu()
+        return model.optimize(starts, target_direction=target).detach().cpu()
 
     if model_name == "NOS_C":
-        return model.optimize(
-            starts,
-            target_direction=target,
-            num_steps=args.num_steps,
-            step_size=args.step_size,
-            stability_coef=args.stability_coef,
-            target_abs=abs(float(args.direction)),
-        ).detach().cpu()
+        return model.optimize(starts, target_direction=target, mask=mask).detach().cpu()
 
     if model_name == "NOS_D":
-        return model.optimize(
-            starts,
-            target_direction=target,
-            num_steps=args.num_steps,
-            step_size=args.step_size,
-            stability_coef=args.stability_coef,
-            target_abs=abs(float(args.direction)),
-            use_reveal_schedule=True,
-        ).detach().cpu()
+        return model.optimize(starts, target_direction=target, mask=mask).detach().cpu()
 
     if model_name == "gg_dWJS":
-        return model.optimize(
-            starts,
-            target_direction=target,
-            num_steps=args.num_steps,
-            guide_scale=args.guide_scale,
-            pad_mask=mask,
-        ).detach().cpu()
+        return model.optimize(starts, target_direction=target, pad_mask=mask).detach().cpu()
 
     if model_name == "EM":
-        return model.optimize(
-            starts,
-            target_direction=target,
-            t_end=float(args.t_end),
-            dt=float(args.dt),
-            guide_scale=args.guide_scale,
-            pad_mask=mask,
-        ).detach().cpu()
+        return model.optimize(starts, target_direction=target, pad_mask=mask).detach().cpu()
 
     if model_name == "MPGD":
+        if seed_labels is None:
+            raise ValueError("MPGD optimize requires seed_labels for y* = y_seed + direction*y_delta.")
         return model.optimize(
             starts,
+            seed_labels=seed_labels.to(device),
             target_direction=target,
-            num_steps=args.num_steps,
-            guide_scale=args.guide_scale,
             pad_mask=mask,
         ).detach().cpu()
 
     if model_name == "MFM":
-        return model.optimize(
-            starts,
-            target_direction=target,
-            num_steps=args.num_steps,
-            pad_mask=mask,
-        ).detach().cpu()
+        return model.optimize(starts, target_direction=target, pad_mask=mask).detach().cpu()
 
     if model_name == "PCD":
-        return model.optimize(
-            starts,
-            target_direction=target,
-            num_steps=args.num_steps,
-            guide_scale=args.guide_scale,
-            pad_mask=mask,
-        ).detach().cpu()
+        return model.optimize(starts, target_direction=target, pad_mask=mask).detach().cpu()
 
     raise ValueError(f"No guided optimize path for model '{model_name}'.")
 
@@ -633,9 +580,15 @@ def run_guided(args, device: str) -> str:
     outs: List[torch.Tensor] = []
     for i in range(0, sampled_x.shape[0], args.batch_size):
         batch = sampled_x[i : i + args.batch_size]
+        batch_y = sampled_y[i : i + args.batch_size]
         outs.append(
             optimize_baseline_batch(
-                args.model, model, batch, args=args, device=device
+                args.model,
+                model,
+                batch,
+                args=args,
+                device=device,
+                seed_labels=batch_y,
             )
         )
     new_sequences = torch.cat(outs, dim=0)
@@ -664,12 +617,6 @@ def run_guided(args, device: str) -> str:
         sugar_w=0.0,
         extra_meta={
             "method": args.method,
-            "num_steps": int(args.num_steps),
-            "step_size": float(args.step_size),
-            "guide_scale": float(args.guide_scale),
-            "num_candidates": int(args.num_candidates),
-            "forward_steps": int(args.forward_steps),
-            "stability_coef": float(args.stability_coef),
             "max_starts": int(args.max_starts),
         },
     )
@@ -697,18 +644,8 @@ def parse_args():
     p.add_argument("--experiment", type=str, required=True, help="Experiment id (no seed).")
     p.add_argument("--seed", type=int, default=1, help="Training seed; loads checkpoint under seed_{seed}/.")
     p.add_argument("--subsample_seed", type=int, default=42, help="RNG for start-pool subsample.")
-    p.add_argument(
-        "--max_starts",
-        type=int,
-        default=1000,
-        help="Max number of start sequences sampled from the test pool.",
-    )
-    p.add_argument(
-        "--starts_cache",
-        type=str,
-        default="",
-        help="Optional .pt path: load shared starts if present, else sample and save.",
-    )
+    p.add_argument("--max_starts", type=int, default=1000, help="Max start sequences sampled from the test pool.")
+    p.add_argument("--starts_cache", type=str, default="", help="Optional .pt path for shared starts cache.")
     p.add_argument("--direction", type=float, default=1.0, help="+1 maximize / -1 minimize property.")
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--num_workers", type=int, default=0)
@@ -723,9 +660,9 @@ def parse_args():
     p.add_argument("--latent_normalization", type=str, default="none", choices=["none", "normal", "minmax"])
     p.add_argument("--knn_k", type=int, default=1)
 
-    # Shared / Langevin / baseline step controls
-    p.add_argument("--num_steps", type=int, default=100, help="Langevin steps (OAE) or baseline optimize steps.")
-    p.add_argument("--step_size", type=float, default=5e-3, help="Langevin step (OAE) or NOS guidance step.")
+    # Shared / Langevin / OAE step controls
+    p.add_argument("--num_steps", type=int, default=100, help="Langevin steps (OAE).")
+    p.add_argument("--step_size", type=float, default=5e-3, help="Langevin step size (OAE).")
     p.add_argument("--temperature", type=float, default=1e-3)
     p.add_argument("--step_size_rescale", type=float, default=None)
     p.add_argument("--use_fitness", action="store_true", default=True)
@@ -735,14 +672,6 @@ def parse_args():
     p.add_argument("--projector_iters", type=int, default=1)
     p.add_argument("--annealed", action="store_true", default=False)
     p.add_argument("--save_trajectories", action="store_true", default=False)
-
-    # Baseline guided optimization
-    p.add_argument("--num_candidates", type=int, default=1, help="DiffAb / IgLM candidate count.")
-    p.add_argument("--forward_steps", type=int, default=100, help="DiffAb forward-noise steps.")
-    p.add_argument("--stability_coef", type=float, default=1.0, help="NOS guidance stability coef.")
-    p.add_argument("--guide_scale", type=float, default=1.0, help="Property guidance scale (EM/MPGD/gg_dWJS/PCD).")
-    p.add_argument("--t_end", type=float, default=1.0, help="EM sampling end time.")
-    p.add_argument("--dt", type=float, default=0.01, help="EM Euler-Maruyama step.")
     return p.parse_args()
 
 

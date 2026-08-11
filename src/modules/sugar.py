@@ -450,8 +450,7 @@ def augment_latents_with_sugar(
 ) -> torch.Tensor:
     """Append SUGAR-generated latents to ``latents``.
 
-    Matches the mRNA-translation / constraint_diffusion protocol:
-    fit SUGAR on up to ``max_fit_points`` train latents, then keep
+    Fit SUGAR on up to ``max_fit_points`` train latents, then keep
     ``int(sugar_w * n_sugar)`` of the generated points (with replacement if
     ``sugar_w > 1``).
     """

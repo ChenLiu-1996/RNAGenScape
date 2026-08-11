@@ -214,7 +214,7 @@ class DiffAb(nn.Module):
 
     @torch.no_grad()
     def optimize(self, sequences, device, target_direction="increase",
-                 num_candidates=1, forward_steps=100, mask=None, verbose=False):
+                 num_candidates=5, forward_steps=10, mask=None, verbose=False):
         '''Optimization starting from a sequence.'''
         if len(sequences.shape) == 1:
             sequences = sequences.unsqueeze(0)
