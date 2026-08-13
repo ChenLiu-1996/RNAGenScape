@@ -20,7 +20,7 @@ class MFM(nn.Module):
         self,
         vocab_size: int = 7,
         seq_len: int = 150,
-        latent_dim: int = 64,
+        latent_dim: int = 128,
         hidden_dim: int = 128,
         num_layers: int = 2,
         num_heads: int = 4,
@@ -414,7 +414,7 @@ class MFM(nn.Module):
 class _ConvAE(nn.Module):
     """1D-conv autoencoder over token sequences."""
 
-    def __init__(self, vocab_size: int = 7, length: int = 150, latent_dim: int = 64):
+    def __init__(self, vocab_size: int = 7, length: int = 150, latent_dim: int = 128):
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.length = int(length)

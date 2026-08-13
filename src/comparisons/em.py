@@ -22,7 +22,7 @@ class EM(nn.Module):
         self,
         vocab_size: int = 7,
         seq_len: int = 150,
-        latent_dim: int = 64,
+        latent_dim: int = 128,
         hidden_dim: int = 128,
         num_layers: int = 2,
         num_heads: int = 4,
@@ -35,9 +35,9 @@ class EM(nn.Module):
         lambda_cd: float = 1e-4,
         n_gibbs: int = 200,
         dt_gibbs: float = 0.01,
-        cd_clamp: float = 1.0,
+        cd_clamp: float = 0.05,
         phase1_steps: int = 10000,
-        phase2_steps: int = 1000,
+        phase2_steps: int = 200,
         ema_decay: float = 0.999,
         ema_decay_cd: float = 0.99,
         tau_s: float = 1.7,
@@ -384,7 +384,7 @@ class EM(nn.Module):
 class _ConvAE(nn.Module):
     """1D-conv autoencoder over token sequences."""
 
-    def __init__(self, vocab_size: int = 7, length: int = 150, latent_dim: int = 64):
+    def __init__(self, vocab_size: int = 7, length: int = 150, latent_dim: int = 128):
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.length = int(length)
