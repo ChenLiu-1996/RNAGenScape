@@ -54,8 +54,9 @@ class PCD(nn.Module):
         self.c = nn.Parameter(torch.zeros(self.hidden_dim))
 
         # Persistent fantasy particles as token ids [buffer, L] (paper: chains ~= minibatch).
+        # Training-only state; not required for guided optimize from seeds.
         init = torch.randint(1, max(self.vocab_size, 2), (self.buffer_size, self.seq_len))
-        self.register_buffer("fantasy_tokens", init, persistent=True)
+        self.register_buffer("fantasy_tokens", init, persistent=False)
 
         self.prop_input = nn.Linear(self.vocab_size, prop_hidden)
         self.property_head = nn.Sequential(
@@ -137,33 +138,41 @@ class PCD(nn.Module):
         return out
 
     def _ensure_fantasy(self, batch_size: int, template: torch.Tensor) -> None:
-        """Keep fantasy chain count equal to the minibatch (paper PCD recipe)."""
-        if (
-            self.fantasy_tokens is not None
-            and self.fantasy_tokens.shape[0] == batch_size
-            and self.fantasy_tokens.shape[1] == template.shape[1]
-        ):
+        """Ensure fantasy buffer covers ``batch_size`` chains (never shrink mid-epoch)."""
+        need_l = int(template.shape[1])
+        have = self.fantasy_tokens
+        if have is not None and have.shape[0] >= batch_size and have.shape[1] == need_l:
             return
+        n = max(int(self.buffer_size), int(batch_size), 1 if have is None else int(have.shape[0]))
         init = torch.randint(
             1,
             max(self.vocab_size, 2),
-            (batch_size, template.shape[1]),
+            (n, need_l),
             device=template.device,
             dtype=torch.long,
         )
         pad_mask = template[0] != self.pad_token_id
         init = torch.where(pad_mask.unsqueeze(0), init, torch.full_like(init, self.pad_token_id))
-        self.register_buffer("fantasy_tokens", init, persistent=True)
-        self.buffer_size = batch_size
+        if have is not None and have.shape[1] == need_l and have.shape[0] > 0:
+            n_copy = min(have.shape[0], n)
+            init[:n_copy] = have[:n_copy]
+        self.register_buffer("fantasy_tokens", init, persistent=False)
+        self.buffer_size = n
 
     @torch.no_grad()
     def _pcd_negatives(self, tokens_pos: torch.Tensor, pad_mask: Optional[torch.Tensor]) -> torch.Tensor:
-        """Advance all persistent chains by ``n_gibbs`` full Gibbs steps; return negatives."""
+        """Advance persistent chains by ``n_gibbs`` Gibbs steps; return negatives."""
         batch_size = tokens_pos.shape[0]
         self._ensure_fantasy(batch_size, tokens_pos)
-        v_k = self._gibbs_k(self.fantasy_tokens, self.n_gibbs, pad_mask=pad_mask)
-        self.fantasy_tokens.copy_(v_k)
+        chains = self.fantasy_tokens[:batch_size]
+        v_k = self._gibbs_k(chains, self.n_gibbs, pad_mask=pad_mask)
+        self.fantasy_tokens[:batch_size].copy_(v_k)
         return v_k
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        # Drop training-only fantasy chains (size varies with last minibatch).
+        state_dict = {k: v for k, v in state_dict.items() if k != "fantasy_tokens"}
+        return super().load_state_dict(state_dict, strict=False, assign=assign)
 
     # ------------------------------------------------------------- property
     def predict_property(

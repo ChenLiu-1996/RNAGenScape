@@ -41,7 +41,7 @@ class EM(nn.Module):
         ema_decay: float = 0.999,
         ema_decay_cd: float = 0.99,
         tau_s: float = 1.7,
-        zeta: float = 0.03,
+        zeta: float = 0.01,
         num_properties: int = 1,
         device: Optional[Union[str, torch.device]] = None,
     ):

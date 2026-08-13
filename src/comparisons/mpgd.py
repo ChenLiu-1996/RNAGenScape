@@ -29,9 +29,9 @@ class MPGD(nn.Module):
         pot_layers: int = 4,
         recon_p: float = 0.5,
         bank_size: int = 8192,
-        scale: float = 0.2,
+        scale: float = 0.1,
         t0_frac: float = 0.8,
-        y_delta: float = 2.0,
+        y_delta: float = 1.0,
         eta: float = 1.0,
         device: Optional[Union[str, torch.device]] = None,
     ):
