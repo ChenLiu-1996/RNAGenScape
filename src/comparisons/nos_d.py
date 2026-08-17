@@ -329,67 +329,70 @@ class NOS_D(nn.Module):
         return 0.2 + 0.8 * frac  # start at 0.2, end at 1.0
 
     def _guided_step(self, x_t, t, guidance_kwargs, mask, use_reveal_schedule):
-        """Guided denoising step using property gradients"""
-        step_size = guidance_kwargs.get("step_size", 1.0)
-        stability_coef = guidance_kwargs.get("stability_coef", 1e-3)
+        """Guided denoising step using property gradients (NOS Langevin in emb space)."""
+        step_size = float(guidance_kwargs.get("step_size", 1.0))
+        stability_coef = float(guidance_kwargs.get("stability_coef", 0.01))
+        n_langevin = int(
+            guidance_kwargs.get(
+                "n_langevin", guidance_kwargs.get("num_steps", 10)
+            )
+        )
         target_values = guidance_kwargs["target_values"]
 
-        # For discrete guidance, we need to work in embedding space then convert back
-        with torch.enable_grad():
-            # Convert to embeddings for gradient computation
-            x_emb = self.token_embedding(x_t)
-            x_emb = x_emb.clone().detach().requires_grad_(True)
+        x_emb = self.token_embedding(x_t).detach()
+        time_emb = self.time_embedding(t)
 
-            # Forward pass through rest of network
-            x_emb_pos = self.pos_encoding(x_emb)
-            time_emb = self.time_embedding(t)
+        for _ in range(max(n_langevin, 1)):
+            with torch.enable_grad():
+                x_emb = x_emb.detach().requires_grad_(True)
+                x_emb_pos = self.pos_encoding(x_emb)
+                for layer in self.transformer_layers:
+                    x_emb_pos = layer(x_emb_pos, time_emb, mask)
+                x_emb_pos = self.output_norm(x_emb_pos)
 
-            # Apply transformer layers
-            for layer in self.transformer_layers:
-                x_emb_pos = layer(x_emb_pos, time_emb, mask)
+                if self.num_properties <= 0:
+                    break
 
-            x_emb_pos = self.output_norm(x_emb_pos)
-
-            if self.num_properties > 0:
-                # Property prediction for guidance
                 if mask is not None:
-                    pooled = (x_emb_pos * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1)
+                    pooled = (x_emb_pos * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(
+                        dim=1, keepdim=True
+                    ).clamp(min=1)
                 else:
                     pooled = x_emb_pos.mean(dim=1)
 
                 property_pred = self.property_head(pooled)
 
-                # Convert target values to tensor
                 if isinstance(target_values, (int, float)):
-                    target_values = torch.full_like(property_pred, target_values)
+                    tgt = torch.full_like(property_pred, float(target_values))
                 elif isinstance(target_values, (list, tuple)):
-                    target_values = torch.tensor(target_values, device=self.device).expand_as(property_pred)
+                    tgt = torch.tensor(
+                        target_values, device=self.device, dtype=property_pred.dtype
+                    ).expand_as(property_pred)
+                else:
+                    tgt = target_values.to(device=self.device, dtype=property_pred.dtype)
+                    if tgt.dim() == 1:
+                        tgt = tgt.unsqueeze(-1)
+                    tgt = tgt.expand_as(property_pred)
 
-                # Compute guidance loss
-                guidance_loss = F.mse_loss(property_pred, target_values)
-
-                # Compute gradients w.r.t. embeddings
+                guidance_loss = F.mse_loss(property_pred, tgt)
                 grad = torch.autograd.grad(guidance_loss, x_emb, retain_graph=False)[0]
-
-                # Apply guided update in embedding space
-                x_emb_guided = x_emb - step_size * grad
-                x_emb_guided = x_emb_guided + stability_coef * torch.randn_like(x_emb_guided)
-
-                # Convert back to tokens using similarity to embedding matrix
                 with torch.no_grad():
-                    # Compute similarity to all token embeddings
-                    token_similarities = F.cosine_similarity(
-                        x_emb_guided.unsqueeze(-2),  # [B, L, 1, H]
-                        self.token_embedding.weight.unsqueeze(0).unsqueeze(0),  # [1, 1, V, H]
-                        dim=-1
-                    )  # [B, L, V]
+                    x_emb = x_emb - step_size * grad
+                    if stability_coef > 0:
+                        x_emb = x_emb + stability_coef * torch.randn_like(x_emb)
 
-                    # Sample from similarities (with temperature)
-                    temperature = 0.1
-                    token_probs = F.softmax(token_similarities / temperature, dim=-1)
-                    x_t = torch.multinomial(token_probs.view(-1, self.vocab_size), 1).view(x_t.shape)
+        with torch.no_grad():
+            token_similarities = F.cosine_similarity(
+                x_emb.unsqueeze(-2),
+                self.token_embedding.weight.unsqueeze(0).unsqueeze(0),
+                dim=-1,
+            )
+            temperature = 0.1
+            token_probs = F.softmax(token_similarities / temperature, dim=-1)
+            x_t = torch.multinomial(token_probs.view(-1, self.vocab_size), 1).view(
+                x_t.shape
+            )
 
-        # Regular denoising step
         return self._denoising_step(x_t, t, mask, use_reveal_schedule=use_reveal_schedule)
 
     def optimize(
@@ -399,14 +402,18 @@ class NOS_D(nn.Module):
         target_direction="increase",
         num_steps=50,
         step_size=1.0,
-        stability_coef=1e-3,
+        stability_coef=0.01,
         target_abs=1.0,
         mask=None,
+        n_langevin: int = 10,
         use_reveal_schedule=True,
     ):
         """Property-guided NOS-D sampling starting from all-MASK tokens.
 
         ``sequences`` only sets batch size (and optional ``mask`` shape fallback).
+
+        ``num_steps`` = reverse diffusion length. ``n_langevin`` = official NOS
+        ``guidance_kwargs.num_steps`` (Langevin guidance iters per diffusion step).
         """
         sequences = sequences.to(self.device)
         if sequences.dim() == 1:
@@ -424,6 +431,7 @@ class NOS_D(nn.Module):
             "step_size": float(step_size),
             "stability_coef": float(stability_coef),
             "target_values": [target],
+            "n_langevin": int(n_langevin),
         }
         return self.sample(
             batch_size,
@@ -585,7 +593,7 @@ if __name__ == "__main__":
     guided = model.sample(
         batch_size=batch_size,
         num_steps=5,
-        guidance_kwargs={"step_size": 1.0, "stability_coef": 0.01, "target_values": [0.5]},
+        guidance_kwargs={"step_size": 1.0, "stability_coef": 0.01, "n_langevin": 10, "target_values": [0.5]},
         use_reveal_schedule=True,
     )
     assert guided.shape == (batch_size, seq_len)

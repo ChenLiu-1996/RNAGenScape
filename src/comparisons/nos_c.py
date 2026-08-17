@@ -206,7 +206,7 @@ class NOS_C(nn.Module):
         *,
         temperature: float = 1.0,
     ) -> torch.Tensor:
-        """NOS-C reverse step: decode tokens → re-embed → Gaussian re-noise to ``t_prev``.
+        """NOS-C reverse step: decode tokens, re-embed, Gaussian re-noise to ``t_prev``.
 
         This is the continuous transition (embedding-space), not a discrete token jump.
         """
@@ -225,9 +225,16 @@ class NOS_C(nn.Module):
 
     def _langevin_guide(self, x_t: torch.Tensor, t: torch.Tensor, guidance_kwargs, mask):
         """Property gradient steps in continuous embedding space (NOS guidance)."""
+        # Official NOS guidance_kwargs: step_size=1.0, stability_coef=0.01,
+        # num_steps=10: that num_steps is Langevin micro-steps (our n_langevin),
+        # not the reverse-diffusion chain length.
         step_size = float(guidance_kwargs.get("step_size", 1.0))
-        stability_coef = float(guidance_kwargs.get("stability_coef", 1e-3))
-        n_langevin = int(guidance_kwargs.get("n_langevin", 1))
+        stability_coef = float(guidance_kwargs.get("stability_coef", 0.01))
+        n_langevin = int(
+            guidance_kwargs.get(
+                "n_langevin", guidance_kwargs.get("num_steps", 10)
+            )
+        )
         target_values = guidance_kwargs["target_values"]
 
         x = x_t
@@ -316,15 +323,18 @@ class NOS_C(nn.Module):
         target_direction="increase",
         num_steps=50,
         step_size=1.0,
-        stability_coef=1e-3,
+        stability_coef=0.01,
         target_abs=1.0,
         mask=None,
-        n_langevin: int = 1,
+        n_langevin: int = 10,
         temperature: float = 1.0,
     ):
         """Property-guided NOS-C sampling (continuous embedding reverse chain).
 
         ``sequences`` only sets batch size / optional mask shape (de-novo from noise).
+
+        ``num_steps`` = reverse diffusion length. ``n_langevin`` = official NOS
+        ``guidance_kwargs.num_steps`` (Langevin guidance iters per diffusion step).
         """
         sequences = sequences.to(self.device)
         if sequences.dim() == 1:
@@ -445,7 +455,12 @@ if __name__ == "__main__":
     guided, _ = model.sample(
         batch_size=batch_size,
         num_steps=10,
-        guidance_kwargs={"step_size": 0.1, "stability_coef": 0.01, "target_values": [0.5]},
+        guidance_kwargs={
+            "step_size": 1.0,
+            "stability_coef": 0.01,
+            "n_langevin": 10,
+            "target_values": [0.5],
+        },
     )
     assert guided.shape == (batch_size, seq_len)
     assert (guided != 0).any()
