@@ -331,7 +331,7 @@ class NOS_D(nn.Module):
     def _guided_step(self, x_t, t, guidance_kwargs, mask, use_reveal_schedule):
         """Guided denoising step using property gradients"""
         step_size = guidance_kwargs.get("step_size", 1.0)
-        stability_coef = guidance_kwargs.get("stability_coef", 0.01)
+        stability_coef = guidance_kwargs.get("stability_coef", 1e-3)
         target_values = guidance_kwargs["target_values"]
 
         # For discrete guidance, we need to work in embedding space then convert back
@@ -398,8 +398,8 @@ class NOS_D(nn.Module):
         *,
         target_direction="increase",
         num_steps=50,
-        step_size=0.1,
-        stability_coef=5.0,
+        step_size=1.0,
+        stability_coef=1e-3,
         target_abs=1.0,
         mask=None,
         use_reveal_schedule=True,

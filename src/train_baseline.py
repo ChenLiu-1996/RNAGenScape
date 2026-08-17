@@ -119,9 +119,6 @@ def build_model(model_name: str, *, seq_len: int, device: str) -> torch.nn.Modul
             vocab_size=VOCAB_SIZE,
             seq_len=seq_len,
             hidden_dim=128,
-            num_layers=2,
-            num_heads=4,
-            sigma=1.0,
             num_properties=1,
             device=device,
         )
@@ -130,8 +127,6 @@ def build_model(model_name: str, *, seq_len: int, device: str) -> torch.nn.Modul
             vocab_size=VOCAB_SIZE,
             seq_len=seq_len,
             latent_dim=128,
-            phase1_steps=10000,
-            phase2_steps=10000,
             device=device,
         )
     if model_name == "MPGD":
@@ -660,7 +655,7 @@ def parse_args():
     p.add_argument("--flow_epochs", type=int, default=200, help="MFM flow epochs.")
     p.add_argument("--pred_epochs", type=int, default=100, help="EM predictor epochs.")
     p.add_argument("--phase1_steps", type=int, default=10000, help="EM potential OT steps.")
-    p.add_argument("--phase2_steps", type=int, default=10000, help="EM potential CD steps.")
+    p.add_argument("--phase2_steps", type=int, default=1000, help="EM potential CD steps.")
     p.add_argument("--pot_lr", type=float, default=1e-4, help="EM potential Adam lr.")
     p.add_argument("--pot_warmup", type=int, default=500, help="EM potential LR warmup steps.")
     p.add_argument("--pot_grad_clip", type=float, default=1.0, help="EM potential grad clip.")

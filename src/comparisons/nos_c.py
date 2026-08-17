@@ -225,8 +225,8 @@ class NOS_C(nn.Module):
 
     def _langevin_guide(self, x_t: torch.Tensor, t: torch.Tensor, guidance_kwargs, mask):
         """Property gradient steps in continuous embedding space (NOS guidance)."""
-        step_size = float(guidance_kwargs.get("step_size", 0.1))
-        stability_coef = float(guidance_kwargs.get("stability_coef", 0.01))
+        step_size = float(guidance_kwargs.get("step_size", 1.0))
+        stability_coef = float(guidance_kwargs.get("stability_coef", 1e-3))
         n_langevin = int(guidance_kwargs.get("n_langevin", 1))
         target_values = guidance_kwargs["target_values"]
 
@@ -315,8 +315,8 @@ class NOS_C(nn.Module):
         *,
         target_direction="increase",
         num_steps=50,
-        step_size=0.1,
-        stability_coef=0.01,
+        step_size=1.0,
+        stability_coef=1e-3,
         target_abs=1.0,
         mask=None,
         n_langevin: int = 1,
