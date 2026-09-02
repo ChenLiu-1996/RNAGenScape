@@ -29,19 +29,19 @@ class EM(nn.Module):
         dropout: float = 0.1,
         pot_hidden: int = 128,
         pot_layers: int = 4,
-        output_scale: float = 1.0,
+        output_scale: float = 10.0,
         time_cutoff: float = 0.9,
         epsilon_max: float = 0.1,
         lambda_cd: float = 1e-4,
-        n_gibbs: int = 200,
+        n_gibbs: int = 100,
         dt_gibbs: float = 0.01,
         cd_clamp: float = 0.05,
         phase1_steps: int = 10000,
         phase2_steps: int = 1000,
         ema_decay: float = 0.999,
         ema_decay_cd: float = 0.99,
-        tau_s: float = 0.25,
-        zeta: float = 0.01,
+        tau_s: float = 1.0,
+        zeta: float = 0.02,
         num_properties: int = 1,
         device: Optional[Union[str, torch.device]] = None,
     ):
@@ -295,11 +295,10 @@ class EM(nn.Module):
         batch_size: int,
         *,
         seed_tokens: Optional[torch.Tensor] = None,
-        t_end: Optional[float] = None,
         dt: float = 0.01,
         guidance: bool = True,
         direction: float = 1.0,
-        guide_scale: float = 1.0,
+        guide_scale: float = 0.1,
         zeta: Optional[float] = None,
         pad_mask: Optional[torch.Tensor] = None,
         return_traj: bool = False,
@@ -310,9 +309,8 @@ class EM(nn.Module):
             raise ValueError("EM latent sampling requires seed_tokens (data-initialised Alg. 3).")
         seed_tokens = seed_tokens.to(self.device)
         batch_size = seed_tokens.shape[0]
-        tau_s = float(self.tau_s if t_end is None else t_end)
         dt = float(dt)
-        n_steps = max(int(round(tau_s / dt)), 1)
+        n_steps = max(int(round(float(self.tau_s) / dt)), 1)
         zeta = float(self.zeta if zeta is None else zeta)
         y_target = 1.0 if float(direction) >= 0.0 else 0.0
         y_lo = float(self.y_lo.item())
@@ -358,9 +356,8 @@ class EM(nn.Module):
         sequences: torch.Tensor,
         *,
         target_direction: str = "increase",
-        t_end: Optional[float] = None,
         dt: float = 0.01,
-        guide_scale: float = 1.0,
+        guide_scale: float = 0.1,
         zeta: Optional[float] = None,
         pad_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -369,7 +366,6 @@ class EM(nn.Module):
         return self.sample(
             batch_size=sequences.shape[0],
             seed_tokens=sequences,
-            t_end=t_end,
             dt=dt,
             guidance=True,
             direction=direction,
@@ -511,8 +507,8 @@ if __name__ == "__main__":
     model._ema_update(phase2=True)
 
     model.eval()
-    out = model.optimize(sequences[:4], target_direction="increase", t_end=0.05, dt=0.01)
+    out = model.optimize(sequences[:4], target_direction="increase", dt=0.01)
     assert out.shape == (4, seq_len)
-    out_neg = model.optimize(sequences[:4], target_direction="decrease", t_end=0.05, dt=0.01)
+    out_neg = model.optimize(sequences[:4], target_direction="decrease", dt=0.01)
     assert out_neg.shape == (4, seq_len)
     print("EM unit tests passed.")
