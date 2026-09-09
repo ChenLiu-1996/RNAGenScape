@@ -375,13 +375,13 @@ def train_mfm_d2d(
     device: str,
     lr: float,
     batch_size: int,
-    ae_epochs: int,
-    geo_epochs: int,
-    flow_epochs: int,
     ckpt_path: str,
     log_path: str,
 ) -> Dict[str, float]:
     """Staged MFM training: AE, tertile latent pool, geopath, then flow."""
+    ae_epochs = model.ae_epochs
+    geo_epochs = model.geo_epochs
+    flow_epochs = model.flow_epochs
     model.to(device)
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
     log_f = open(log_path, "w", encoding="utf-8")
@@ -507,18 +507,18 @@ def train_em_staged(
     *,
     device: str,
     lr: float,
-    pot_lr: float,
     batch_size: int,
-    ae_epochs: int,
-    pred_epochs: int,
-    phase1_steps: int,
-    phase2_steps: int,
-    pot_warmup: int,
-    pot_grad_clip: float,
     ckpt_path: str,
     log_path: str,
 ) -> Dict[str, float]:
     """Staged EM training: AE, latent pool, predictor, then potential (OT then CD)."""
+    ae_epochs = model.ae_epochs
+    pred_epochs = model.pred_epochs
+    phase1_steps = model.phase1_steps
+    phase2_steps = model.phase2_steps
+    pot_lr = model.pot_lr
+    pot_warmup = model.pot_warmup
+    pot_grad_clip = model.pot_grad_clip
     model.to(device)
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
     log_f = open(log_path, "w", encoding="utf-8")
@@ -650,15 +650,6 @@ def parse_args():
     p.add_argument("--recon_w", type=float, default=1.0, help="Weight on generative / reconstruction loss.")
     p.add_argument("--max_epochs", type=int, default=200)
     p.add_argument("--patience", type=int, default=20, help="Early stop patience on val loss.")
-    p.add_argument("--ae_epochs", type=int, default=200, help="MFM/EM AE stage epochs.")
-    p.add_argument("--geo_epochs", type=int, default=100, help="MFM LAND geopath epochs.")
-    p.add_argument("--flow_epochs", type=int, default=200, help="MFM flow epochs.")
-    p.add_argument("--pred_epochs", type=int, default=100, help="EM predictor epochs.")
-    p.add_argument("--phase1_steps", type=int, default=10000, help="EM potential OT steps.")
-    p.add_argument("--phase2_steps", type=int, default=1000, help="EM potential CD steps.")
-    p.add_argument("--pot_lr", type=float, default=1e-4, help="EM potential Adam lr.")
-    p.add_argument("--pot_warmup", type=int, default=500, help="EM potential LR warmup steps.")
-    p.add_argument("--pot_grad_clip", type=float, default=1.0, help="EM potential grad clip.")
     p.add_argument("--label_norm", type=str, default="normal", choices=["none", "normal", "minmax"])
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--num_workers", type=int, default=0)
@@ -713,20 +704,22 @@ def main() -> None:
     if args.model == "MFM":
         meta.update(
             {
-                "ae_epochs": args.ae_epochs,
-                "geo_epochs": args.geo_epochs,
-                "flow_epochs": args.flow_epochs,
+                "ae_epochs": model.ae_epochs,
+                "geo_epochs": model.geo_epochs,
+                "flow_epochs": model.flow_epochs,
                 "protocol": "mfm_d2d_staged_full_train_latent_pool",
             }
         )
     if args.model == "EM":
         meta.update(
             {
-                "ae_epochs": args.ae_epochs,
-                "pred_epochs": args.pred_epochs,
-                "phase1_steps": args.phase1_steps,
-                "phase2_steps": args.phase2_steps,
-                "pot_lr": args.pot_lr,
+                "ae_epochs": model.ae_epochs,
+                "pred_epochs": model.pred_epochs,
+                "phase1_steps": model.phase1_steps,
+                "phase2_steps": model.phase2_steps,
+                "pot_lr": model.pot_lr,
+                "n_gibbs": model.n_gibbs,
+                "tau_s": model.tau_s,
                 "protocol": "em_staged_full_train_latent_pool",
             }
         )
@@ -750,7 +743,8 @@ def main() -> None:
     if args.model == "MFM":
         print(
             f"optimizer=AdamW lr={args.lr} wd=1e-4  "
-            f"MFM staged ae/geo/flow={args.ae_epochs}/{args.geo_epochs}/{args.flow_epochs}"
+            f"MFM staged ae/geo/flow="
+            f"{model.ae_epochs}/{model.geo_epochs}/{model.flow_epochs}"
         )
         train_mfm_d2d(
             model,
@@ -758,31 +752,21 @@ def main() -> None:
             device=device,
             lr=args.lr,
             batch_size=args.batch_size,
-            ae_epochs=args.ae_epochs,
-            geo_epochs=args.geo_epochs,
-            flow_epochs=args.flow_epochs,
             ckpt_path=ckpt_path,
             log_path=log_path,
         )
     elif args.model == "EM":
         print(
-            f"optimizer=AdamW(ae/pred) lr={args.lr} wd=1e-4; Adam(pot) lr={args.pot_lr}  "
-            f"EM staged ae/pred/pot={args.ae_epochs}/{args.pred_epochs}/"
-            f"{args.phase1_steps}+{args.phase2_steps}"
+            f"optimizer=AdamW(ae/pred) lr={args.lr} wd=1e-4; Adam(pot) lr={model.pot_lr}  "
+            f"EM staged ae/pred/pot={model.ae_epochs}/{model.pred_epochs}/"
+            f"{model.phase1_steps}+{model.phase2_steps}"
         )
         train_em_staged(
             model,
             train_loader,
             device=device,
             lr=args.lr,
-            pot_lr=args.pot_lr,
             batch_size=args.batch_size,
-            ae_epochs=args.ae_epochs,
-            pred_epochs=args.pred_epochs,
-            phase1_steps=args.phase1_steps,
-            phase2_steps=args.phase2_steps,
-            pot_warmup=args.pot_warmup,
-            pot_grad_clip=args.pot_grad_clip,
             ckpt_path=ckpt_path,
             log_path=log_path,
         )

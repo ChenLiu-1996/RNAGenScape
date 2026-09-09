@@ -204,7 +204,7 @@ class NOS_C(nn.Module):
         gt_vals=None,
         guidance_layer: str = "first",
         step_size: float = 0.1,
-        stability_coef: float = 1.0,
+        stability_coef: float = 0.5,
         num_steps: int = 5,
         guidance_sign: float = 1.0,
     ):
@@ -367,7 +367,7 @@ class NOS_C(nn.Module):
         *,
         target_direction: str = "increase",
         step_size: float = 0.1,
-        stability_coef: float = 1.0,
+        stability_coef: float = 0.5,
         n_langevin: int = 10,
         guidance_layer: str = "first",
         return_best: bool = True,

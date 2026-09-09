@@ -32,6 +32,9 @@ class MFM(nn.Module):
         n_metric_samples: int = 4096,
         q_lo: float = 1.0 / 3.0,
         q_hi: float = 2.0 / 3.0,
+        ae_epochs: int = 200,
+        geo_epochs: int = 100,
+        flow_epochs: int = 200,
         num_properties: int = 1,
         device: Optional[Union[str, torch.device]] = None,
     ):
@@ -54,6 +57,9 @@ class MFM(nn.Module):
         self.n_metric_samples = int(n_metric_samples)
         self.q_lo = float(q_lo)
         self.q_hi = float(q_hi)
+        self.ae_epochs = int(ae_epochs)
+        self.geo_epochs = int(geo_epochs)
+        self.flow_epochs = int(flow_epochs)
         self.use_geopath = self.alpha != 0.0
 
         self.ae = _ConvAE(vocab_size=self.vocab_size, length=self.seq_len, latent_dim=self.latent_dim)
