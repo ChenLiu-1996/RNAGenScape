@@ -1,11 +1,11 @@
 """Train the Organized Autoencoder (OAE).
 
 Example:
-  python src/train_oae.py --dataset OpenVaccine --lr 1e-3 --recon_w 5.0 --latent_dim 128 --seed 1
+  python src/train_oae.py --dataset OpenVaccine --lr 1e-3 --recon_w 5.0 --reg_w 1.0 --latent_dim 128 --seed 1
 
-Saves under ``results/<dataset>/OAE/d{latent}_recon{w}/seed_{seed}/``.
+Saves under ``results/<dataset>/OAE/d{latent}_recon{w}_reg{reg}/seed_{seed}/``.
 
-Loss: ``MSE + recon_w * CE`` (deterministic AE; regression weight fixed at 1).
+Loss: ``reg_w * MSE + recon_w * CE`` (deterministic AE).
 
 Best checkpoint / early stop: maximize
 ``0.5 * (pearson_r + spearman_r) + token_acc`` on val (not val loss).
@@ -44,6 +44,7 @@ def _combined_loss(
     y: torch.Tensor,
     *,
     recon_w: float,
+    reg_w: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return (loss, recon_loss, regression_loss, y_hat, logits)."""
     z = model.encode(x)
@@ -51,7 +52,7 @@ def _combined_loss(
     y_hat = model.regress(z)
     recon_loss = model.reconstruction_loss(logits, x.argmax(dim=-1))
     regression_loss = model.regression_loss(y_hat, y)
-    loss = regression_loss + recon_w * recon_loss
+    loss = reg_w * regression_loss + recon_w * recon_loss
     return loss, recon_loss, regression_loss, y_hat, logits
 
 
@@ -78,6 +79,7 @@ def evaluate(
     *,
     device: str,
     recon_w: float,
+    reg_w: float,
 ) -> Dict[str, float]:
     """Return val metrics including combined loss, recon/regression, correlations, accuracy."""
     model.eval()
@@ -93,7 +95,7 @@ def evaluate(
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         loss, recon_loss, regression_loss, y_hat, logits = _combined_loss(
-            model, x, y, recon_w=recon_w
+            model, x, y, recon_w=recon_w, reg_w=reg_w
         )
         token_acc, seq_acc = _recon_accuracy(logits, x)
         total_loss += loss.item()
@@ -128,6 +130,7 @@ def train(
     *,
     device: str,
     recon_w: float,
+    reg_w: float,
     optimizer: torch.optim.Optimizer,
     lr_scheduler: torch.optim.lr_scheduler._LRScheduler | None,
     max_epochs: int,
@@ -168,7 +171,7 @@ def train(
             for x, y in train_loader:
                 x, y = x.to(device), y.to(device)
                 loss, recon_loss, regression_loss, y_hat, logits = _combined_loss(
-                    model, x, y, recon_w=recon_w
+                    model, x, y, recon_w=recon_w, reg_w=reg_w
                 )
                 optimizer.zero_grad()
                 loss.backward()
@@ -199,7 +202,9 @@ def train(
                 if len(train_y_true) > 1
                 else float("nan")
             )
-            val = evaluate(model, val_loader, device=device, recon_w=recon_w)
+            val = evaluate(
+                model, val_loader, device=device, recon_w=recon_w, reg_w=reg_w
+            )
 
             line = (
                 f"{epoch},{lr:.8e},"
@@ -258,6 +263,7 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--recon_w", type=float, default=5.0, help="Weight on reconstruction CE.")
+    p.add_argument("--reg_w", type=float, default=1.0, help="Weight on property MSE.")
     p.add_argument("--latent_dim", type=int, default=DEFAULT_LATENT_DIM, help="Latent bottleneck (64 or 128).")
     p.add_argument("--max_epochs", type=int, default=100)
     p.add_argument("--patience", type=int, default=20, help="Early stop patience on val selection score.")
@@ -285,7 +291,8 @@ def main() -> None:
     print(
         f"dataset={args.dataset} model=OAE latent_dim={args.latent_dim} "
         f"n_train={info.n_train} n_val={info.n_val} n_test={info.n_test} "
-        f"representation=one_hot label_norm={args.label_norm} recon_w={args.recon_w}"
+        f"representation=one_hot label_norm={args.label_norm} "
+        f"recon_w={args.recon_w} reg_w={args.reg_w}"
     )
 
     model = OAE(
@@ -316,6 +323,7 @@ def main() -> None:
         args.seed,
         latent_dim=args.latent_dim,
         recon_w=args.recon_w,
+        reg_w=args.reg_w,
     )
     out_dir = os.path.dirname(ckpt_path)
     os.makedirs(out_dir, exist_ok=True)
@@ -331,6 +339,7 @@ def main() -> None:
                 "dataset": args.dataset,
                 "model": "OAE",
                 "recon_w": args.recon_w,
+                "reg_w": args.reg_w,
                 "latent_dim": args.latent_dim,
                 "seed": args.seed,
             },
@@ -352,6 +361,7 @@ def main() -> None:
                 "conv_len": model.conv_len,
                 "num_up": model.num_up,
                 "recon_w": args.recon_w,
+                "reg_w": args.reg_w,
                 "lr": args.lr,
                 "max_epochs": args.max_epochs,
                 "patience": args.patience,
@@ -371,6 +381,7 @@ def main() -> None:
         val_loader,
         device=device,
         recon_w=args.recon_w,
+        reg_w=args.reg_w,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         max_epochs=args.max_epochs,
@@ -380,8 +391,12 @@ def main() -> None:
     )
 
     # Metrics on the restored best checkpoint (val + test).
-    val = evaluate(model, val_loader, device=device, recon_w=args.recon_w)
-    test = evaluate(model, test_loader, device=device, recon_w=args.recon_w)
+    val = evaluate(
+        model, val_loader, device=device, recon_w=args.recon_w, reg_w=args.reg_w
+    )
+    test = evaluate(
+        model, test_loader, device=device, recon_w=args.recon_w, reg_w=args.reg_w
+    )
     print(
         f"test loss={test['loss']:.4f} recon={test['recon']:.4f} "
         f"regression={test['regression']:.4f} "
@@ -395,6 +410,7 @@ def main() -> None:
             args.seed,
             latent_dim=args.latent_dim,
             recon_w=args.recon_w,
+            reg_w=args.reg_w,
         ),
         {
             "dataset": args.dataset,
@@ -402,6 +418,7 @@ def main() -> None:
             "seed": args.seed,
             "latent_dim": args.latent_dim,
             "recon_w": args.recon_w,
+            "reg_w": args.reg_w,
             "selection_metric": "0.5*(pearson+spearman)+token_acc",
             "best_val_selection": history.get("best_val_selection"),
             "val": val,

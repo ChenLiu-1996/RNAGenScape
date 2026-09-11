@@ -4,7 +4,8 @@ Example:
   python src/train_oracle.py --dataset OpenVaccine --oracle UTRLM
   python src/train_oracle.py --dataset OpenVaccine --oracle Conv1d
 
-Saves ``results/<dataset>/<oracle>/model.pt`` (and ``label_stats.json``).
+Saves ``results/<dataset>/<oracle>/model.pt``, ``label_stats.json``, and
+``metrics.json`` (val + test mse / pearson / spearman).
 Only trainable architectures are allowed (never UTRLM_TE / UTRLM_MRL).
 Default trainable oracle in bash scripts remains ``UTRLM``.
 """
@@ -26,6 +27,7 @@ _SRC = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+from analysis.metrics_io import write_metrics
 from dataset import DATASET_CONFIG, DATASET_NAMES, make_dataloaders
 from utils.metrics import VOCAB_SIZE
 from utils.oracle import TRAINABLE_ORACLES, oracle_checkpoint_path, resolve_device
@@ -288,7 +290,7 @@ def main() -> None:
         )
     print(f"wrote label stats -> {stats_path}")
 
-    train(
+    history = train(
         model,
         train_loader,
         val_loader,
@@ -302,12 +304,41 @@ def main() -> None:
         log_path=log_path,
     )
 
+    # Metrics on the restored best checkpoint (val + test).
+    val_mse, val_pearson, val_spearman = evaluate(
+        model, val_loader, device=device, representation=representation
+    )
     test_mse, test_pearson, test_spearman = evaluate(
         model, test_loader, device=device, representation=representation
     )
     print(
+        f"val  mse={val_mse:.4f} pearson={val_pearson:.4f} spearman={val_spearman:.4f}"
+    )
+    print(
         f"test mse={test_mse:.4f} pearson={test_pearson:.4f} spearman={test_spearman:.4f}"
     )
+    metrics_path = write_metrics(
+        out_dir,
+        {
+            "dataset": args.dataset,
+            "oracle": args.oracle,
+            "seed": args.seed,
+            "label_norm": args.label_norm,
+            "selection_metric": "val_spearman",
+            "best_val_spearman": history.get("best_val_spearman"),
+            "val": {
+                "mse": val_mse,
+                "pearson": val_pearson,
+                "spearman": val_spearman,
+            },
+            "test": {
+                "mse": test_mse,
+                "pearson": test_pearson,
+                "spearman": test_spearman,
+            },
+        },
+    )
+    print(f"wrote metrics     -> {metrics_path}")
     print(f"checkpoint: {ckpt_path}")
 
 

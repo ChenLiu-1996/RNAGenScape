@@ -27,6 +27,7 @@ from utils.results import oae_seed_dir
 DEFAULT_DATASETS = ("OpenVaccine", "Zebrafish", "RibosomeLoading")
 DEFAULT_LATENT_DIMS = (64, 128)
 DEFAULT_RECON_WS = (0.1, 0.5, 1.0, 5.0, 10.0)
+DEFAULT_REG_W = 1.0
 DEFAULT_SEEDS = (1, 2, 3)
 DEFAULT_METRICS = ("token_acc", "pearson", "spearman")
 
@@ -43,6 +44,7 @@ def collect_metric(
     dataset: str,
     latent_dim: int,
     recon_w: float,
+    reg_w: float,
     seeds: Sequence[int],
     metric: str,
     split: str,
@@ -51,7 +53,12 @@ def collect_metric(
     values: List[float] = []
     for seed in seeds:
         run_dir = oae_seed_dir(
-            dataset, int(seed), latent_dim=int(latent_dim), recon_w=float(recon_w), root=root
+            dataset,
+            int(seed),
+            latent_dim=int(latent_dim),
+            recon_w=float(recon_w),
+            reg_w=float(reg_w),
+            root=root,
         )
         payload = read_metrics(run_dir)
         if payload is None:
@@ -71,6 +78,7 @@ def format_table(
     datasets: Sequence[str],
     latent_dims: Sequence[int],
     recon_ws: Sequence[float],
+    reg_w: float,
     seeds: Sequence[int],
     metrics: Sequence[str],
     split: str,
@@ -80,8 +88,8 @@ def format_table(
     """Markdown table: one row per (dataset, D, recon_w); cells are mean +/- std."""
     header_metrics = " | ".join(metrics)
     lines = [
-        f"| dataset | D | recon_w | n | {header_metrics} |",
-        "|---|---:|---:|---:|" + "|".join(["---:" for _ in metrics]) + "|",
+        f"| dataset | D | recon_w | reg_w | n | {header_metrics} |",
+        "|---|---:|---:|---:|---:|" + "|".join(["---:" for _ in metrics]) + "|",
     ]
     for dataset in datasets:
         for latent_dim in latent_dims:
@@ -93,6 +101,7 @@ def format_table(
                         dataset=dataset,
                         latent_dim=int(latent_dim),
                         recon_w=float(recon_w),
+                        reg_w=float(reg_w),
                         seeds=seeds,
                         metric=metric,
                         split=split,
@@ -101,7 +110,7 @@ def format_table(
                     n_used = max(n_used, len(vals))
                     cols.append(mean_pm_std(vals, digits=digits))
                 lines.append(
-                    f"| {dataset} | {latent_dim} | {recon_w:g} | {n_used} | "
+                    f"| {dataset} | {latent_dim} | {recon_w:g} | {reg_w:g} | {n_used} | "
                     + " | ".join(cols)
                     + " |"
                 )
@@ -113,6 +122,7 @@ def parse_args():
     p.add_argument("--datasets", type=str, nargs="+", default=list(DEFAULT_DATASETS), choices=sorted(DATASET_NAMES))
     p.add_argument("--latent_dims", type=int, nargs="+", default=list(DEFAULT_LATENT_DIMS))
     p.add_argument("--recon_ws", type=float, nargs="+", default=list(DEFAULT_RECON_WS))
+    p.add_argument("--reg_w", type=float, default=DEFAULT_REG_W, help="Regression weight in OAE path tag.")
     p.add_argument("--seeds", type=int, nargs="+", default=list(DEFAULT_SEEDS))
     p.add_argument("--metrics", type=str, nargs="+", default=list(DEFAULT_METRICS), help="Keys under the split block in metrics.json.")
     p.add_argument("--split", type=str, default="test", choices=["test", "val"], help="Which split block to aggregate.")
@@ -127,6 +137,7 @@ def main() -> None:
         datasets=args.datasets,
         latent_dims=args.latent_dims,
         recon_ws=args.recon_ws,
+        reg_w=args.reg_w,
         seeds=args.seeds,
         metrics=args.metrics,
         split=args.split,

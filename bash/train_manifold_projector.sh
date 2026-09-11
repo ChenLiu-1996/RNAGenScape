@@ -25,9 +25,10 @@ source .venv/bin/activate
 
 DATASETS=(OpenVaccine Zebrafish RibosomeLoading)
 SEEDS=(1 2 3)
-# Must match the trained OAE ablation folder: d{LATENT_DIM}_recon{RECON_W}
+# Must match the trained OAE ablation folder: d{LATENT_DIM}_recon{RECON_W}_reg{REG_W}
 LATENT_DIM=128
 RECON_W=5.0
+REG_W=1.0
 
 # dae: train weights; knn: cache train (+SUGAR) latents (k chosen at generation)
 PROJECTORS=(dae knn)
@@ -39,10 +40,12 @@ float_tag() {
   PYTHONPATH="${ROOT_DIR}/src" python -c "from utils.results import float_tag; print(float_tag(float('${1}')))"
 }
 RECON_TAG="$(float_tag "${RECON_W}")"
+REG_TAG="$(float_tag "${REG_W}")"
+OAE_TAG="d${LATENT_DIM}_recon${RECON_TAG}_reg${REG_TAG}"
 
 for data in "${DATASETS[@]}"; do
   for seed in "${SEEDS[@]}"; do
-    oae_ckpt="${ROOT_DIR}/results/${data}/OAE/d${LATENT_DIM}_recon${RECON_TAG}/seed_${seed}/model.pt"
+    oae_ckpt="${ROOT_DIR}/results/${data}/OAE/${OAE_TAG}/seed_${seed}/model.pt"
     if [[ ! -f "${oae_ckpt}" ]]; then
       echo "========== SKIP ${data} seed=${seed} (missing OAE ckpt: ${oae_ckpt}) =========="
       continue
@@ -51,16 +54,16 @@ for data in "${DATASETS[@]}"; do
       sugar_tag="$(float_tag "${sugar_w}")"
       for projector in "${PROJECTORS[@]}"; do
         if [[ "${projector}" == "dae" ]]; then
-          out="${ROOT_DIR}/results/${data}/OAE/d${LATENT_DIM}_recon${RECON_TAG}/seed_${seed}/manifold_projector_dae_sugar${sugar_tag}/model_latentnorm_none.pt"
+          out="${ROOT_DIR}/results/${data}/OAE/${OAE_TAG}/seed_${seed}/manifold_projector_dae_sugar${sugar_tag}/model_latentnorm_none.pt"
         else
-          out="${ROOT_DIR}/results/${data}/OAE/d${LATENT_DIM}_recon${RECON_TAG}/seed_${seed}/manifold_projector_knn_sugar${sugar_tag}/latent_trainset.pt"
+          out="${ROOT_DIR}/results/${data}/OAE/${OAE_TAG}/seed_${seed}/manifold_projector_knn_sugar${sugar_tag}/latent_trainset.pt"
         fi
         if [[ "${SKIP_EXISTING}" == "1" && -f "${out}" ]]; then
           echo "========== SKIP ${projector} ${data} seed=${seed} sugar=${sugar_w} (exists) =========="
           continue
         fi
 
-        echo "========== Projector ${projector} on ${data} seed=${seed} D=${LATENT_DIM} recon_w=${RECON_W} sugar_w=${sugar_w} =========="
+        echo "========== Projector ${projector} on ${data} seed=${seed} D=${LATENT_DIM} recon_w=${RECON_W} reg_w=${REG_W} sugar_w=${sugar_w} =========="
         python src/train_manifold_projector.py \
           --dataset "${data}" \
           --projector "${projector}" \
@@ -79,6 +82,6 @@ for data in "${DATASETS[@]}"; do
 done
 
 echo "Done."
-echo "  DAE: results/<dataset>/OAE/d${LATENT_DIM}_recon${RECON_TAG}/seed_*/manifold_projector_dae_sugar*/"
-echo "  kNN: results/<dataset>/OAE/d${LATENT_DIM}_recon${RECON_TAG}/seed_*/manifold_projector_knn_sugar*/"
+echo "  DAE: results/<dataset>/OAE/${OAE_TAG}/seed_*/manifold_projector_dae_sugar*/"
+echo "  kNN: results/<dataset>/OAE/${OAE_TAG}/seed_*/manifold_projector_knn_sugar*/"
 echo "  Ablate k at generation via --projector knn --knn_k {1,5,10}."

@@ -22,7 +22,7 @@ import argparse
 import json
 import os
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -56,6 +56,7 @@ from utils.starts_cache import (
     starts_content_hash,
 )
 from utils.training_utils import seed_everything
+from utils.timing import CudaTimer, ms_per_sample
 
 METHODS = ("rnagenscape", "guided", "denovo")
 DEFAULT_DAE_HIDDEN_DIMS = (32, 16, 32)
@@ -230,6 +231,7 @@ def load_projector(
     oae_latent_dim: int,
     device: str,
     hidden_dims: Tuple[int, ...] = DEFAULT_DAE_HIDDEN_DIMS,
+    dae_tag: Optional[str] = None,
 ):
     if projector == "dae":
         path = manifold_projector_dae_checkpoint_path(
@@ -238,6 +240,7 @@ def load_projector(
             latent_dim=oae_latent_dim,
             recon_w=recon_w,
             sugar_w=sugar_w,
+            dae_tag=dae_tag,
             latent_normalization=latent_normalization,
         )
         if not os.path.isfile(path):
@@ -362,6 +365,7 @@ def run_rnagenscape(args, device: str) -> str:
         recon_w=args.recon_w,
         oae_latent_dim=args.latent_dim,
         device=device,
+        dae_tag=(str(args.dae_tag).strip() or None),
     )
 
     seed_everything(args.seed)
@@ -372,23 +376,31 @@ def run_rnagenscape(args, device: str) -> str:
         f"temperature={args.temperature} use_projector={args.use_projector} "
         f"direction={args.direction}"
     )
-    z_gen, trajectories = run_manifold_langevin(
-        sampled_latent.to(device),
-        projector,
-        fitness_fn=fitness_fn,
-        direction=float(args.direction),
-        num_steps=args.num_steps,
-        step_size=args.step_size,
-        temperature=args.temperature,
-        step_size_rescale=args.step_size_rescale,
-        use_projector=args.use_projector,
-        projector_iters=args.projector_iters,
-        annealed=args.annealed,
-        batch_size=args.batch_size,
-        return_history=True,
+    with CudaTimer() as timer:
+        z_gen, trajectories = run_manifold_langevin(
+            sampled_latent.to(device),
+            projector,
+            fitness_fn=fitness_fn,
+            direction=float(args.direction),
+            num_steps=args.num_steps,
+            step_size=args.step_size,
+            temperature=args.temperature,
+            step_size_rescale=args.step_size_rescale,
+            use_projector=args.use_projector,
+            projector_iters=args.projector_iters,
+            annealed=args.annealed,
+            batch_size=args.batch_size,
+            return_history=bool(args.save_trajectories),
+        )
+        new_sequences = decode_latents(oae, z_gen, device=device, batch_size=args.batch_size)
+    n_gen = int(new_sequences.shape[0])
+    gen_ms = ms_per_sample(timer.elapsed, n_gen)
+    print(
+        f"generation timing: {timer.elapsed:.3f}s for {n_gen} samples "
+        f"= {gen_ms:.3f} ms/sample",
+        flush=True,
     )
 
-    new_sequences = decode_latents(oae, z_gen, device=device, batch_size=args.batch_size)
     seq_trajectories = None
     if trajectories is not None and args.save_trajectories:
         print(f"decoding trajectories {tuple(trajectories.shape)} ...")
@@ -438,6 +450,9 @@ def run_rnagenscape(args, device: str) -> str:
             "oae_latent_dim": int(args.latent_dim),
             "oae_recon_w": float(args.recon_w),
             "max_starts": int(args.max_starts),
+            "elapsed_seconds": float(timer.elapsed),
+            "ms_per_sample": float(gen_ms),
+            "n_timed": n_gen,
         },
     )
     print(f"wrote {path}")
@@ -578,21 +593,29 @@ def run_guided(args, device: str) -> str:
 
     seed_everything(args.seed)
     outs: List[torch.Tensor] = []
-    for i in range(0, sampled_x.shape[0], args.batch_size):
-        batch = sampled_x[i : i + args.batch_size]
-        batch_y = sampled_y[i : i + args.batch_size]
-        outs.append(
-            optimize_baseline_batch(
-                args.model,
-                model,
-                batch,
-                args=args,
-                device=device,
-                seed_labels=batch_y,
+    with CudaTimer() as timer:
+        for i in range(0, sampled_x.shape[0], args.batch_size):
+            batch = sampled_x[i : i + args.batch_size]
+            batch_y = sampled_y[i : i + args.batch_size]
+            outs.append(
+                optimize_baseline_batch(
+                    args.model,
+                    model,
+                    batch,
+                    args=args,
+                    device=device,
+                    seed_labels=batch_y,
+                )
             )
-        )
-    new_sequences = torch.cat(outs, dim=0)
+        new_sequences = torch.cat(outs, dim=0)
     assert new_sequences.shape[0] == sampled_x.shape[0]
+    n_gen = int(new_sequences.shape[0])
+    gen_ms = ms_per_sample(timer.elapsed, n_gen)
+    print(
+        f"generation timing: {timer.elapsed:.3f}s for {n_gen} samples "
+        f"= {gen_ms:.3f} ms/sample",
+        flush=True,
+    )
 
     out_dir = os.path.join(
         experiment_dir(args.dataset, args.model, args.experiment),
@@ -618,6 +641,9 @@ def run_guided(args, device: str) -> str:
         extra_meta={
             "method": args.method,
             "max_starts": int(args.max_starts),
+            "elapsed_seconds": float(timer.elapsed),
+            "ms_per_sample": float(gen_ms),
+            "n_timed": n_gen,
         },
     )
     print(f"wrote {path}")
@@ -652,11 +678,12 @@ def parse_args():
 
     # OAE ablation folder (rnagenscape only)
     p.add_argument("--latent_dim", type=int, default=128, help="OAE latent dim; path OAE/d{latent}_recon{w}/.")
-    p.add_argument("--recon_w", type=float, default=5.0, help="OAE recon weight; path OAE/d{latent}_recon{w}/.")
+    p.add_argument("--recon_w", type=float, default=5.0, help="OAE recon weight; path OAE/d{latent}_recon{w}_reg1e0/.")
 
     # RNAGenScape / projector
     p.add_argument("--projector", type=str, default="dae", choices=["dae", "knn"])
     p.add_argument("--sugar_w", type=float, default=0.0)
+    p.add_argument("--dae_tag", type=str, default="", help="Optional DAE path tag (e.g. steps1). Empty loads manifold_projector_dae_sugar{w}/.")
     p.add_argument("--latent_normalization", type=str, default="none", choices=["none", "normal", "minmax"])
     p.add_argument("--knn_k", type=int, default=1)
 

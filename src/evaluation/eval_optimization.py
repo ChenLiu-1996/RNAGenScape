@@ -50,7 +50,7 @@ def parse_args():
     p.add_argument("--oracle", type=str, required=True, choices=sorted(SUPPORTED_ORACLES))
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--latent_dim", type=int, default=128, help="For OAE: path tag d{latent}_recon{w}.")
-    p.add_argument("--recon_w", type=float, default=5.0, help="For OAE: path tag d{latent}_recon{w}.")
+    p.add_argument("--recon_w", type=float, default=5.0, help="For OAE: path tag d{latent}_recon{w}_reg1e0.")
     return p.parse_args()
 
 

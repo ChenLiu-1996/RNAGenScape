@@ -76,20 +76,26 @@ def float_tag(value: float) -> str:
     return f"{prefix}{coeff}e{int(exp)}"
 
 
-def oae_config_tag(latent_dim: int, recon_w: float) -> str:
-    """Ablation folder for an OAE variant: ``d128_recon5e0``."""
-    return f"d{int(latent_dim)}_recon{float_tag(recon_w)}"
+def oae_config_tag(latent_dim: int, recon_w: float, reg_w: float = 1.0) -> str:
+    """Ablation folder for an OAE variant: ``d128_recon5e0_reg1e0``."""
+    return (
+        f"d{int(latent_dim)}_recon{float_tag(recon_w)}_reg{float_tag(reg_w)}"
+    )
 
 
 def oae_config_dir(
     dataset: str,
     latent_dim: int,
     recon_w: float,
+    reg_w: float = 1.0,
     root: Optional[str] = None,
 ) -> str:
-    """``results/<dataset>/OAE/d{latent}_recon{w}/``."""
+    """``results/<dataset>/OAE/d{latent}_recon{w}_reg{reg}/``."""
     return os.path.join(
-        results_root(root), dataset, "OAE", oae_config_tag(latent_dim, recon_w)
+        results_root(root),
+        dataset,
+        "OAE",
+        oae_config_tag(latent_dim, recon_w, reg_w),
     )
 
 
@@ -100,12 +106,13 @@ def experiment_dir(
     *,
     oae_latent_dim: Optional[int] = None,
     oae_recon_w: Optional[float] = None,
+    oae_reg_w: float = 1.0,
     root: Optional[str] = None,
 ) -> str:
     """Experiment outputs dir.
 
     For OAE, generation/eval live under the ablation config:
-    ``results/<dataset>/OAE/d{latent}_recon{w}/<experiment>/``.
+    ``results/<dataset>/OAE/d{latent}_recon{w}_reg{reg}/<experiment>/``.
     """
     if model == "OAE":
         if oae_latent_dim is None or oae_recon_w is None:
@@ -113,7 +120,13 @@ def experiment_dir(
                 "experiment_dir(..., model='OAE') requires oae_latent_dim and oae_recon_w"
             )
         return os.path.join(
-            oae_config_dir(dataset, oae_latent_dim, oae_recon_w, root=root),
+            oae_config_dir(
+                dataset,
+                oae_latent_dim,
+                oae_recon_w,
+                reg_w=oae_reg_w,
+                root=root,
+            ),
             experiment,
         )
     return os.path.join(results_root(root), dataset, model, experiment)
@@ -125,11 +138,12 @@ def oae_seed_dir(
     *,
     latent_dim: int,
     recon_w: float,
+    reg_w: float = 1.0,
     root: Optional[str] = None,
 ) -> str:
-    """``results/<dataset>/OAE/d{latent}_recon{w}/seed_{seed}/``."""
+    """``results/<dataset>/OAE/d{latent}_recon{w}_reg{reg}/seed_{seed}/``."""
     return os.path.join(
-        oae_config_dir(dataset, latent_dim, recon_w, root=root),
+        oae_config_dir(dataset, latent_dim, recon_w, reg_w=reg_w, root=root),
         f"seed_{int(seed)}",
     )
 
@@ -140,12 +154,18 @@ def oae_checkpoint_path(
     *,
     latent_dim: int,
     recon_w: float,
+    reg_w: float = 1.0,
     root: Optional[str] = None,
 ) -> str:
-    """``results/<dataset>/OAE/d{latent}_recon{w}/seed_{seed}/model.pt``."""
+    """``results/<dataset>/OAE/d{latent}_recon{w}_reg{reg}/seed_{seed}/model.pt``."""
     return os.path.join(
         oae_seed_dir(
-            dataset, seed, latent_dim=latent_dim, recon_w=recon_w, root=root
+            dataset,
+            seed,
+            latent_dim=latent_dim,
+            recon_w=recon_w,
+            reg_w=reg_w,
+            root=root,
         ),
         "model.pt",
     )
@@ -184,21 +204,41 @@ def normalize_latent_norm_name(latent_normalization: str) -> str:
     return name
 
 
+def _dae_projector_dirname(sugar_w: float, dae_tag: Optional[str] = None) -> str:
+    """Directory leaf for a DAE projector.
+
+    Default (multi-step / locked): ``manifold_projector_dae_sugar{w}``.
+    Tagged (e.g. single-step): ``manifold_projector_dae_{tag}_sugar{w}``.
+    """
+    sugar = _sugar_tag(sugar_w)
+    tag = str(dae_tag or "").strip()
+    if tag:
+        return f"manifold_projector_dae_{tag}_sugar{sugar}"
+    return f"manifold_projector_dae_sugar{sugar}"
+
+
 def manifold_projector_dae_dir(
     dataset: str,
     seed: int,
     *,
     latent_dim: int,
     recon_w: float,
+    reg_w: float = 1.0,
     sugar_w: float = 0.0,
+    dae_tag: Optional[str] = None,
     root: Optional[str] = None,
 ) -> str:
-    """``.../OAE/d{latent}_recon{w}/seed_{seed}/manifold_projector_dae_sugar{w}/``."""
+    """``.../seed_{seed}/manifold_projector_dae[_tag]_sugar{w}/``."""
     return os.path.join(
         oae_seed_dir(
-            dataset, seed, latent_dim=latent_dim, recon_w=recon_w, root=root
+            dataset,
+            seed,
+            latent_dim=latent_dim,
+            recon_w=recon_w,
+            reg_w=reg_w,
+            root=root,
         ),
-        f"manifold_projector_dae_sugar{_sugar_tag(sugar_w)}",
+        _dae_projector_dirname(sugar_w, dae_tag=dae_tag),
     )
 
 
@@ -208,11 +248,13 @@ def manifold_projector_dae_checkpoint_path(
     *,
     latent_dim: int,
     recon_w: float,
+    reg_w: float = 1.0,
     sugar_w: float = 0.0,
+    dae_tag: Optional[str] = None,
     latent_normalization: str = "none",
     root: Optional[str] = None,
 ) -> str:
-    """``.../seed_{seed}/manifold_projector_dae_sugar{w}/model_latentnorm_{norm}.pt``."""
+    """``.../manifold_projector_dae[_tag]_sugar{w}/model_latentnorm_{norm}.pt``."""
     norm = normalize_latent_norm_name(latent_normalization)
     return os.path.join(
         manifold_projector_dae_dir(
@@ -220,7 +262,9 @@ def manifold_projector_dae_checkpoint_path(
             seed,
             latent_dim=latent_dim,
             recon_w=recon_w,
+            reg_w=reg_w,
             sugar_w=sugar_w,
+            dae_tag=dae_tag,
             root=root,
         ),
         f"model_latentnorm_{norm}.pt",
@@ -233,13 +277,19 @@ def manifold_projector_knn_dir(
     *,
     latent_dim: int,
     recon_w: float,
+    reg_w: float = 1.0,
     sugar_w: float = 0.0,
     root: Optional[str] = None,
 ) -> str:
-    """``.../OAE/d{latent}_recon{w}/seed_{seed}/manifold_projector_knn_sugar{w}/``."""
+    """``.../OAE/d{latent}_recon{w}_reg{reg}/seed_{seed}/manifold_projector_knn_sugar{w}/``."""
     return os.path.join(
         oae_seed_dir(
-            dataset, seed, latent_dim=latent_dim, recon_w=recon_w, root=root
+            dataset,
+            seed,
+            latent_dim=latent_dim,
+            recon_w=recon_w,
+            reg_w=reg_w,
+            root=root,
         ),
         f"manifold_projector_knn_sugar{_sugar_tag(sugar_w)}",
     )
@@ -251,6 +301,7 @@ def latent_trainset_path(
     *,
     latent_dim: int,
     recon_w: float,
+    reg_w: float = 1.0,
     sugar_w: float = 0.0,
     root: Optional[str] = None,
 ) -> str:
@@ -261,6 +312,7 @@ def latent_trainset_path(
             seed,
             latent_dim=latent_dim,
             recon_w=recon_w,
+            reg_w=reg_w,
             sugar_w=sugar_w,
             root=root,
         ),

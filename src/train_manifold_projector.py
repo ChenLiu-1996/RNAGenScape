@@ -5,7 +5,7 @@ Example:
   python src/train_manifold_projector.py --dataset OpenVaccine --projector knn --seed 1
 
 * ``dae``: train ``ManifoldProjectorDAE`` on OAE train latents; save
-  ``.../OAE/d{latent}_recon{w}/seed_{seed}/manifold_projector_dae_sugar{w}/model_latentnorm_{norm}.pt``
+  ``.../OAE/d{latent}_recon{w}_reg1e0/seed_{seed}/manifold_projector_dae_sugar{w}/model_latentnorm_{norm}.pt``
 * ``knn``: **not trainable**. Only encodes the training set with the OAE and
   caches those latents as
   ``.../seed_{seed}/manifold_projector_knn_sugar{w}/latent_trainset.pt``. Choose ``k`` later
@@ -121,13 +121,8 @@ def parse_args():
     p.add_argument("--dataset", type=str, required=True, choices=sorted(DATASET_NAMES))
     p.add_argument("--projector", type=str, required=True, choices=PROJECTOR_CHOICES)
     p.add_argument("--latent_dim", type=int, default=128, help="Must match OAE folder d{latent}_recon{w}.")
-    p.add_argument("--recon_w", type=float, default=5.0, help="Must match OAE folder d{latent}_recon{w}.")
-    p.add_argument(
-        "--sugar_w",
-        type=float,
-        default=0.0,
-        help="SUGAR upsample weight (0=off). Saves under ..._sugar{w}/.",
-    )
+    p.add_argument("--recon_w", type=float, default=5.0, help="Must match OAE folder d{latent}_recon{w}_reg1e0.")
+    p.add_argument("--sugar_w", type=float, default=0.0, help="SUGAR upsample weight (0=off). Saves under ..._sugar{w}/.")
     p.add_argument("--latent_normalization", type=str, default="none", choices=["none", "normal", "minmax"])
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--batch_size", type=int, default=128, help="OAE encode + DAE train batch size.")
@@ -139,6 +134,7 @@ def parse_args():
     p.add_argument("--dae_patience", type=int, default=20)
     p.add_argument("--noise_levels", type=float, nargs="+", default=list(DEFAULT_NOISE_LEVELS))
     p.add_argument("--hidden_dims", type=int, nargs="+", default=list(DEFAULT_HIDDEN_DIMS))
+    p.add_argument("--dae_tag", type=str, default="", help="Optional DAE path tag (e.g. steps1). Empty -> manifold_projector_dae_sugar{w}/.")
     return p.parse_args()
 
 
@@ -216,12 +212,14 @@ def main() -> None:
             device=device,
             random_state=args.seed,
         )
+        dae_tag = str(args.dae_tag or "").strip() or None
         ckpt = manifold_projector_dae_checkpoint_path(
             args.dataset,
             args.seed,
             latent_dim=args.latent_dim,
             recon_w=args.recon_w,
             sugar_w=args.sugar_w,
+            dae_tag=dae_tag,
             latent_normalization=args.latent_normalization,
         )
         os.makedirs(os.path.dirname(ckpt), exist_ok=True)
@@ -230,6 +228,7 @@ def main() -> None:
             {
                 "hidden_dims": list(args.hidden_dims),
                 "noise_levels": list(args.noise_levels),
+                "dae_tag": dae_tag or "",
                 "dae_epochs": args.dae_epochs,
                 "dae_lr": args.dae_lr,
                 **metrics,
