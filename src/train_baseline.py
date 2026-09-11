@@ -30,6 +30,7 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from comparisons import DiffAb, EM, gg_dWJS, IgLM, MFM, MPGD, NOS_C, NOS_D, PCD
+from comparisons_denovo import DDPM, FM, LDM, VAE
 from dataset import DATASET_CONFIG, DATASET_NAMES, make_dataloaders
 from utils.metrics import VOCAB_SIZE, to_token_ids
 from utils.oracle import resolve_device
@@ -37,6 +38,8 @@ from utils.results import baseline_checkpoint_path
 from utils.training_utils import EarlyStopping, LinearWarmupCosineAnnealingLR, seed_everything
 
 BASELINE_MODELS = ("DiffAb", "IgLM", "NOS_C", "NOS_D", "gg_dWJS", "EM", "MPGD", "MFM", "PCD")
+DENOVO_MODELS = ("VAE", "DDPM", "LDM", "FM")
+TRAINABLE_MODELS = BASELINE_MODELS + DENOVO_MODELS
 IGLM_SPECIAL_TOKENS = 3  # CLS, SEP, MASK
 
 # Generative term name per model (property head is always ``property_mse``).
@@ -50,6 +53,10 @@ GEN_LOSS_NAME = {
     "MPGD": "diffusion_mse",
     "MFM": "metric_flow",
     "PCD": "pcd_contrastive",
+    "VAE": "elbo",
+    "DDPM": "noise_mse",
+    "LDM": "latent_noise_mse",
+    "FM": "flow_mse",
 }
 PROP_LOSS_NAME = "property_mse"
 # Models with no property head: corr vs labels is undefined (dummy zero preds).
@@ -153,7 +160,15 @@ def build_model(model_name: str, *, seq_len: int, device: str) -> torch.nn.Modul
             num_properties=1,
             device=device,
         )
-    raise ValueError(f"Unknown baseline model '{model_name}'. Choose from {BASELINE_MODELS}.")
+    if model_name == "VAE":
+        return VAE(vocab_size=VOCAB_SIZE, seq_len=seq_len, latent_dim=32, device=device)
+    if model_name == "DDPM":
+        return DDPM(vocab_size=VOCAB_SIZE, seq_len=seq_len, latent_dim=32, device=device)
+    if model_name == "LDM":
+        return LDM(vocab_size=VOCAB_SIZE, seq_len=seq_len, latent_dim=32, device=device)
+    if model_name == "FM":
+        return FM(vocab_size=VOCAB_SIZE, seq_len=seq_len, latent_dim=32, device=device)
+    raise ValueError(f"Unknown model '{model_name}'. Choose from {TRAINABLE_MODELS}.")
 
 
 def _pad_mask(token_ids: torch.Tensor) -> torch.Tensor:
@@ -185,7 +200,7 @@ def _batch_loss(
         total = recon_w * recon + prop
         return total, recon, prop, y_hat.view(-1)
 
-    if model_name in ("NOS_C", "NOS_D", "gg_dWJS", "EM", "MPGD", "MFM", "PCD"):
+    if model_name in ("NOS_C", "NOS_D", "gg_dWJS", "EM", "MPGD", "MFM", "PCD", "VAE", "DDPM", "LDM", "FM"):
         total, recon, prop, y_hat = model.compute_loss(
             token_ids,
             targets=targets.unsqueeze(-1),
@@ -644,7 +659,7 @@ def train_em_staged(
 def parse_args():
     p = argparse.ArgumentParser(description="Train DiffAb / IgLM / NOS_C / NOS_D / gg_dWJS / EM / MPGD / MFM / PCD baselines.")
     p.add_argument("--dataset", type=str, required=True, choices=sorted(DATASET_NAMES))
-    p.add_argument("--model", type=str, required=True, choices=list(BASELINE_MODELS))
+    p.add_argument("--model", type=str, required=True, choices=list(TRAINABLE_MODELS))
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--recon_w", type=float, default=1.0, help="Weight on generative / reconstruction loss.")

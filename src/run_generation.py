@@ -3,7 +3,8 @@
 Methods:
   * ``rnagenscape`` -- OAE + manifold Langevin + projector (RNAGenScape).
   * ``guided`` -- property-guided optimization of test starts (all baselines).
-  * ``denovo`` -- unconditional generation (not implemented yet).
+  * ``denovo`` -- unconditional generation (VAE / DDPM / LDM / FM).
+  * ``classic`` -- OAE + classic latent opts (GradientAscent / MCMC / HillClimbing).
 
 Examples:
   python src/run_generation.py \\
@@ -32,12 +33,13 @@ _SRC = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+from comparisons_classic import CLASSIC_MODELS, build_classic_optimizer
 from dataset import DATASET_CONFIG, DATASET_NAMES, make_dataloaders
 from modules.langevin import run_manifold_langevin
 from modules.manifold_projector_dae import load_manifold_projector_dae
 from modules.manifold_projector_knn import ManifoldProjectorKNN
 from modules.oae import OAE, load_oae
-from train_baseline import BASELINE_MODELS, build_model
+from train_baseline import BASELINE_MODELS, DENOVO_MODELS, build_model
 from utils.metrics import VOCAB_SIZE, subsample_indices, to_token_ids
 from utils.oracle import resolve_device
 from utils.results import (
@@ -58,7 +60,7 @@ from utils.starts_cache import (
 from utils.training_utils import seed_everything
 from utils.timing import CudaTimer, ms_per_sample
 
-METHODS = ("rnagenscape", "guided", "denovo")
+METHODS = ("rnagenscape", "guided", "denovo", "classic")
 DEFAULT_DAE_HIDDEN_DIMS = (32, 16, 32)
 
 
@@ -539,16 +541,15 @@ def optimize_baseline_batch(
     if model_name == "PCD":
         return model.optimize(starts, target_direction=target, pad_mask=mask).detach().cpu()
 
+    if model_name in DENOVO_MODELS:
+        # Unconditional: seeds only set batch size; direction ignored at sampling.
+        return model.optimize(starts, target_direction=target, pad_mask=mask).detach().cpu()
+
     raise ValueError(f"No guided optimize path for model '{model_name}'.")
 
 
-def run_guided(args, device: str) -> str:
-    if args.model not in BASELINE_MODELS:
-        raise ValueError(
-            f"method=guided requires a baseline --model in {BASELINE_MODELS}; "
-            f"got '{args.model}'. For OAE use --method rnagenscape."
-        )
-
+def _run_baseline_generation(args, device: str) -> str:
+    """Shared artifact pipeline for guided + denovo baselines."""
     model = load_baseline_model(
         args.model, dataset=args.dataset, seed=args.seed, device=device
     )
@@ -564,7 +565,8 @@ def run_guided(args, device: str) -> str:
     )
     print(
         f"dataset={args.dataset} n_train={info.n_train} n_test={info.n_test} "
-        f"model={args.model} seed={args.seed} direction={args.direction}"
+        f"model={args.model} seed={args.seed} direction={args.direction} "
+        f"method={args.method}"
     )
 
     pool_x, pool_y = collect_tokens_and_labels(test_loader, device=device)
@@ -650,15 +652,199 @@ def run_guided(args, device: str) -> str:
     return path
 
 
+def run_guided(args, device: str) -> str:
+    if args.model not in BASELINE_MODELS:
+        raise ValueError(
+            f"method=guided requires a baseline --model in {BASELINE_MODELS}; "
+            f"got '{args.model}'. For OAE use --method rnagenscape."
+        )
+    return _run_baseline_generation(args, device)
+
+
 def run_denovo(args, device: str) -> str:
-    del args, device
-    raise NotImplementedError("method=denovo is not implemented yet.")
+    """Unconditional de novo baselines (VAE/DDPM/LDM/FM).
+
+    Still scores against shared test starts for Delta / % at eval time. Sampling
+    ignores seed content (and direction); POS/NEG therefore share generations.
+    """
+    if args.model not in DENOVO_MODELS:
+        raise ValueError(
+            f"method=denovo requires --model in {DENOVO_MODELS}; got '{args.model}'."
+        )
+    return _run_baseline_generation(args, device)
+
+
+def run_classic(args, device: str) -> str:
+    """OAE + classic latent optimizers (gradient ascent / MCMC / hill climbing).
+
+    Loads the locked OAE checkpoint (``--latent_dim`` / ``--recon_w``) and writes
+    artifacts under ``results/<dataset>/<model>/{pos,neg}_classic/``.
+    """
+    if args.model not in CLASSIC_MODELS:
+        raise ValueError(
+            f"method=classic requires --model in {CLASSIC_MODELS}; got '{args.model}'."
+        )
+
+    oae = load_oae_model(
+        args.dataset,
+        args.seed,
+        device,
+        latent_dim=args.latent_dim,
+        recon_w=args.recon_w,
+    )
+    label_stats = load_label_stats(
+        args.dataset,
+        args.seed,
+        latent_dim=args.latent_dim,
+        recon_w=args.recon_w,
+    )
+
+    train_loader, _val_loader, test_loader, info = make_dataloaders(
+        args.dataset,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        representation="one_hot",
+        label_norm="normal",
+        num_workers=args.num_workers,
+    )
+    print(
+        f"dataset={args.dataset} n_train={info.n_train} n_test={info.n_test} "
+        f"model={args.model} seed={args.seed} direction={args.direction} "
+        f"method={args.method} oae_d={args.latent_dim} recon_w={args.recon_w}"
+    )
+
+    train_latents, _train_y, _train_x = encode_loader(oae, train_loader, device=device)
+    latent_stats = {
+        "latent_mean": float(train_latents.mean().item()),
+        "latent_std": float(train_latents.std().item()),
+        "latent_min": float(train_latents.min().item()),
+        "latent_max": float(train_latents.max().item()),
+    }
+    train_stats = {**label_stats, **latent_stats}
+
+    pool_latent, pool_y, pool_x = encode_loader(oae, test_loader, device=device)
+    indices, from_cache = resolve_start_indices(
+        pool_latent.shape[0],
+        max_starts=args.max_starts,
+        subsample_seed=args.subsample_seed,
+        starts_cache=args.starts_cache,
+    )
+    indices_t = torch.from_numpy(indices.astype(np.int64))
+    sampled_y = pool_y[indices_t]
+    sampled_x = pool_x[indices_t]
+    sampled_indices = indices
+    maybe_save_starts_cache(
+        args.starts_cache,
+        sampled_x=sampled_x,
+        sampled_y=sampled_y,
+        sampled_indices=sampled_indices,
+        from_cache=from_cache,
+    )
+    print(
+        f"starts_hash={starts_content_hash(sampled_x)} n_starts={sampled_x.shape[0]} "
+        f"from_cache={from_cache} start_pool={pool_x.shape[0]} "
+        f"max_starts={args.max_starts} subsample_seed={args.subsample_seed}"
+    )
+
+    if args.model == "GradientAscent":
+        optimizer = build_classic_optimizer(
+            args.model, num_steps=args.num_steps, step_size=args.step_size
+        )
+    elif args.model == "MCMC":
+        optimizer = build_classic_optimizer(
+            args.model,
+            num_steps=args.num_steps,
+            temperature=args.temperature,
+            delta=args.mcmc_delta,
+        )
+    else:
+        optimizer = build_classic_optimizer(
+            args.model,
+            num_steps=args.num_steps,
+            step_size=args.step_size,
+            k_neighbors=args.classic_k_neighbors,
+        )
+
+    target = direction_to_target(args.direction)
+    # Hill climbing needs a manifold neighbor pool; cap size for large datasets.
+    hill_pool = train_latents
+    if args.model in ("HillClimbing", "StochasticHillClimbing"):
+        max_pool = int(args.classic_max_pool)
+        if hill_pool.shape[0] > max_pool:
+            g = torch.Generator().manual_seed(int(args.seed))
+            pick = torch.randperm(hill_pool.shape[0], generator=g)[:max_pool]
+            hill_pool = hill_pool[pick]
+            print(f"hill_climb pool subsampled to {hill_pool.shape[0]} (from train)")
+    train_latents_dev = hill_pool.to(device)
+    seed_everything(args.seed)
+    outs: List[torch.Tensor] = []
+    with CudaTimer() as timer:
+        for i in range(0, sampled_x.shape[0], args.batch_size):
+            batch = sampled_x[i : i + args.batch_size].to(device)
+            outs.append(
+                optimizer.optimize(
+                    batch,
+                    oae=oae,
+                    target_direction=target,
+                    train_latents=train_latents_dev,
+                ).detach().cpu()
+            )
+        new_sequences = torch.cat(outs, dim=0)
+    assert new_sequences.shape[0] == sampled_x.shape[0]
+    n_gen = int(new_sequences.shape[0])
+    gen_ms = ms_per_sample(timer.elapsed, n_gen)
+    print(
+        f"generation timing: {timer.elapsed:.3f}s for {n_gen} samples "
+        f"= {gen_ms:.3f} ms/sample",
+        flush=True,
+    )
+
+    out_dir = os.path.join(
+        experiment_dir(args.dataset, args.model, args.experiment),
+        f"seed_{args.seed}",
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    path = save_generation_artifact(
+        out_dir,
+        new_sequences=new_sequences,
+        sampled_X=sampled_x,
+        sampled_Y=sampled_y,
+        sampled_indices=sampled_indices,
+        sampling_pool_X=pool_x,
+        direction=float(args.direction),
+        train_stats=train_stats,
+        model_type=args.model,
+        data=args.dataset,
+        seed=args.seed,
+        subsample_seed=args.subsample_seed,
+        trajectories=None,
+        trajectories_are_sequences=False,
+        sugar_w=0.0,
+        extra_meta={
+            "method": args.method,
+            "oae_latent_dim": int(args.latent_dim),
+            "oae_recon_w": float(args.recon_w),
+            "num_steps": int(args.num_steps),
+            "step_size": float(args.step_size),
+            "temperature": float(args.temperature),
+            "mcmc_delta": float(args.mcmc_delta),
+            "classic_k_neighbors": int(args.classic_k_neighbors),
+            "classic_max_pool": int(args.classic_max_pool),
+            "max_starts": int(args.max_starts),
+            "elapsed_seconds": float(timer.elapsed),
+            "ms_per_sample": float(gen_ms),
+            "n_timed": n_gen,
+        },
+    )
+    print(f"wrote {path}")
+    return path
 
 
 METHOD_FNS = {
     "rnagenscape": run_rnagenscape,
     "guided": run_guided,
     "denovo": run_denovo,
+    "classic": run_classic,
 }
 
 
@@ -699,6 +885,10 @@ def parse_args():
     p.add_argument("--projector_iters", type=int, default=1)
     p.add_argument("--annealed", action="store_true", default=False)
     p.add_argument("--save_trajectories", action="store_true", default=False)
+    # Classic OAE optimizers (method=classic)
+    p.add_argument("--mcmc_delta", type=float, default=0.1, help="Latent MCMC proposal std (method=classic MCMC).")
+    p.add_argument("--classic_k_neighbors", type=int, default=10, help="kNN pool size for hill climbing (method=classic).")
+    p.add_argument("--classic_max_pool", type=int, default=10000, help="Max train latents for hill-climb neighbor pool.")
     return p.parse_args()
 
 
