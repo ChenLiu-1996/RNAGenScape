@@ -23,6 +23,11 @@ This is the author's repository for the NeurIPS 2026 paper
 The official version is hosted at the [Lab GitHub repo](https://github.com/KrishnaswamyLab/RNAGenScape).
 
 
+<img src="assets/teaser.png" width="800">
+
+<img src="assets/schematic.png" width="800">
+
+
 ## Abstract
 
 Generating property-optimized mRNA sequences is central to applications such as vaccine design and protein replacement therapy, but remains challenging due to limited data, complex sequence-function relationships, and the narrow space of biologically viable sequences. Generative methods that drift away from the data manifold can yield sequences that fail to fold, translate poorly, or are otherwise nonfunctional. We present RNAGenScape, a property-guided manifold Langevin dynamics framework for mRNA sequence generation that operates on a learned manifold of real data. By performing iterative local optimization constrained to this manifold, RNAGenScape preserves favorable computational viability proxies, accesses reliable guidance, and avoids excursions into nonfunctional regions of the ambient sequence space. The framework integrates three components: (1) an autoencoder jointly trained with a property predictor to learn a property-organized latent manifold, (2) a denoising autoencoder that projects updates back onto the manifold, and (3) a property-guided Langevin dynamics procedure that performs optimization along the manifold. Across three real-world mRNA datasets spanning two orders of magnitude in size, RNAGenScape increases median oracle-predicted property gain by up to 79% and success rate by up to 31%, while maintaining good biological viability proxy measures and achieves competitive inference efficiency relative to existing generative approaches.
