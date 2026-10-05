@@ -23,16 +23,10 @@ This is the author's repository for the NeurIPS 2026 paper
 The official version is hosted at the [Lab GitHub repo](https://github.com/KrishnaswamyLab/RNAGenScape).
 
 
+## Abstract
 
-# RNAGenScape
+Generating property-optimized mRNA sequences is central to applications such as vaccine design and protein replacement therapy, but remains challenging due to limited data, complex sequence-function relationships, and the narrow space of biologically viable sequences. Generative methods that drift away from the data manifold can yield sequences that fail to fold, translate poorly, or are otherwise nonfunctional. We present RNAGenScape, a property-guided manifold Langevin dynamics framework for mRNA sequence generation that operates on a learned manifold of real data. By performing iterative local optimization constrained to this manifold, RNAGenScape preserves favorable computational viability proxies, accesses reliable guidance, and avoids excursions into nonfunctional regions of the ambient sequence space. The framework integrates three components: (1) an autoencoder jointly trained with a property predictor to learn a property-organized latent manifold, (2) a denoising autoencoder that projects updates back onto the manifold, and (3) a property-guided Langevin dynamics procedure that performs optimization along the manifold. Across three real-world mRNA datasets spanning two orders of magnitude in size, RNAGenScape increases median oracle-predicted property gain by up to 79% and success rate by up to 31%, while maintaining good biological viability proxy measures and achieves competitive inference efficiency relative to existing generative approaches.
 
-**Property-Guided Optimized Generation of mRNA Sequences with Manifold Langevin Dynamics**
-
-[![arXiv](https://img.shields.io/badge/arXiv-RNAGenScape-firebrick)](https://arxiv.org/pdf/2510.24736)
-
-Generating property-optimized mRNA sequences is central to applications such as vaccine design and protein replacement therapy, but remains challenging: viable sequences occupy a narrow subset of sequence space, data are limited, and unconstrained edits often yield nonfunctional transcripts. RNAGenScape addresses this with property-guided manifold Langevin dynamics that optimize sequences while staying on a learned manifold of real data. It combines three components: (1) an organized autoencoder (OAE) that jointly learns sequence reconstruction and property prediction, (2) a manifold projector that maps updates back onto the data manifold, and (3) property-guided Langevin dynamics that refine latent embeddings under this constraint. The result is local, guided optimization that improves target properties while preserving biological viability.
-
----
 
 ## Environment
 
@@ -58,7 +52,6 @@ UV_HTTP_TIMEOUT=600 CXX=$(which g++) CC=$(which gcc) uv sync --python 3.12
 module unload GCC
 ```
 
----
 
 ## Pretrained UTR-LM weights
 
@@ -72,7 +65,6 @@ curl -L -o checkpoints/utrlm/utrlm_pretrained_siss_ep93.pkl \
 
 Source: [a96123155/UTR-LM](https://github.com/a96123155/UTR-LM/tree/main/Model/Pretrained).
 
----
 
 ## RhoFold (optional folding confidence)
 
@@ -94,7 +86,6 @@ Defaults:
 
 Override with `RHOFOLD_DIR` / `RHOFOLD_CKPT` or `--rhofold_dir` / `--ckpt` if you already have a local install.
 
----
 
 ## Data
 
@@ -106,7 +97,6 @@ Datasets live under `data/` (gitignored; present on disk after setup).
 - Zebrafish: ~55k samples
 - RibosomeLoading: ~260k samples
 
----
 
 ## Method overview
 
@@ -117,17 +107,16 @@ The same procedure is used for each dataset (train / val / test split):
 3. **Generate.** Encode unseen test sequences, run fitness-guided Langevin in latent space with periodic manifold projection, and decode to new sequences.
 4. **Evaluate.** Score start vs. generated sequences with the frozen oracle (property improvement and related metrics).
 
----
 
 ## Citation
 
 If you use RNAGenScape, please cite the paper:
 
 ```
-@article{liao2025rnagenscape,
+@inproceedings{liao2026rnagenscape,
   title={RNAGenScape: Property-Guided, Optimized Generation of mRNA Sequences with Manifold Langevin Dynamics},
   author={Liao, Danqi and Liu, Chen and Sun, Xingzhi and Tang, Di{\'e} and Wang, Haochen and Youlten, Scott and Gopinath, Srikar Krishna and Lee, Haejeong and Strayer, Ethan C and Giraldez, Antonio J and others},
-  journal={arXiv preprint arXiv:2510.24736},
-  year={2025}
+  booktitle={Advances in neural information processing systems},
+  year={2026},
 }
 ```
