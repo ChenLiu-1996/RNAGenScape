@@ -1,3 +1,29 @@
+<div align="center">
+
+  <h1><code>RNAGenScape</code></h1>
+
+  [![arXiv](https://img.shields.io/badge/arXiv-RNAGenScape-firebrick)](https://arxiv.org/abs/2510.24736)
+  [![PDF](https://img.shields.io/badge/PDF-DADBDD)](https://arxiv.org/pdf/2510.24736)
+  [![GitHub Stars](https://img.shields.io/github/stars/ChenLiu-1996/RNAGenScape.svg?style=social\&label=Stars)](https://github.com/ChenLiu-1996/RNAGenScape)
+  <br>[![LinkedIn](https://img.shields.io/badge/LinkedIn-Danqi-blue)](https://www.linkedin.com/in/danqi-liao-4852aba9/)
+  [![LinkedIn](https://img.shields.io/badge/LinkedIn-Chen-blue)](https://www.linkedin.com/in/chenliu1996/)
+  [![LinkedIn](https://img.shields.io/badge/LinkedIn-Xingzhi-blue)](https://www.linkedin.com/in/xingzhi-sun)
+  <br>[![Google Scholar](https://img.shields.io/badge/Scholar-Chen-4a86cf?logo=google-scholar&logoColor=white)](https://scholar.google.com/citations?user=3rDjnykAAAAJ&sortby=pubdate)
+  [![Google Scholar](https://img.shields.io/badge/Scholar-Xingzhi-4a86cf?logo=google-scholar&logoColor=white)](https://scholar.google.com/citations?user=tUvfTd8AAAAJ)
+  <br>[![Twitter Follow](https://img.shields.io/twitter/follow/Danqi.svg?style=social)](https://x.com/DanqiLiao73090)
+  [![Twitter Follow](https://img.shields.io/twitter/follow/Chen.svg?style=social)](https://x.com/ChenLiu_1996)
+  [![Twitter Follow](https://img.shields.io/twitter/follow/Xingzhi.svg?style=social)](https://x.com/https://x.com/XingzhiSun)
+  [![Twitter Follow](https://img.shields.io/twitter/follow/KrishnaswamyLab.svg?style=social)](https://x.com/KrishnaswamyLab)
+
+</div>
+
+This is the author's repository for the NeurIPS 2026 paper
+<br>[RNAGenScape: property-guided, optimized generation of mRNA sequences with manifold Langevin dynamics](https://arxiv.org/pdf/2510.24736).
+
+The official version is hosted at the [Lab GitHub repo](https://github.com/KrishnaswamyLab/RNAGenScape).
+
+
+
 # RNAGenScape
 
 **Property-Guided Optimized Generation of mRNA Sequences with Manifold Langevin Dynamics**
