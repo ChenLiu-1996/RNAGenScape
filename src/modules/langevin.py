@@ -16,48 +16,6 @@ ForceFn = Callable[[torch.Tensor], torch.Tensor]
 StopFn = Callable[[torch.Tensor], bool]
 
 
-def langevin_dynamics(
-    potential_fn: Optional[PotentialFn],
-    x_init: torch.Tensor,
-    num_steps: int,
-    step_size: float,
-    *,
-    return_history: bool = False,
-    stop_fn: Optional[StopFn] = None,
-    seed: Optional[int] = None,
-) -> torch.Tensor:
-    """Plain Langevin dynamics (no manifold projector).
-
-    ``potential_fn(x)`` is treated as an energy / negative-log-density; the
-    update uses score = -grad potential.
-    """
-    if seed is not None:
-        torch.manual_seed(seed)
-    x = x_init.clone().detach().requires_grad_(True)
-    history = [] if return_history else None
-
-    for step in tqdm(range(num_steps), desc="langevin"):
-        if potential_fn is not None:
-            energy = potential_fn(x)
-            grad_energy = torch.autograd.grad(
-                energy, x, grad_outputs=torch.ones_like(energy), create_graph=True
-            )[0]
-            score = -grad_energy
-            x = x + step_size * score + ((2 * step_size) ** 0.5) * torch.randn_like(x)
-        else:
-            x = x + ((2 * step_size) ** 0.5) * torch.randn_like(x)
-        x = x.detach().requires_grad_(True)
-        if history is not None:
-            history.append(x)
-        if stop_fn is not None and stop_fn(x):
-            print(f"Early stopping at step {step}")
-            break
-
-    if history is not None:
-        return torch.stack(history, dim=0).detach()
-    return x.detach()
-
-
 def manifold_langevin_dynamics(
     potential_fn: Optional[PotentialFn],
     projector,

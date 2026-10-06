@@ -67,18 +67,6 @@ def default_pretrained_pkl() -> str:
     return os.path.join(repo_root_from_models(), UTRLM_PRETRAINED_RELPATH)
 
 
-def is_utrlm_oracle(model_or_name) -> bool:
-    if isinstance(model_or_name, str):
-        return model_or_name in UTRLM_ORACLE_NAMES
-    return isinstance(model_or_name, (UTRLMRegressor, UTRLMFrozenHFOracle))
-
-
-def is_frozen_hf_oracle(model_or_name) -> bool:
-    if isinstance(model_or_name, str):
-        return model_or_name in FROZEN_HF_ORACLES
-    return isinstance(model_or_name, UTRLMFrozenHFOracle)
-
-
 class OfficialUtrLmTokenizer:
     """Minimal tokenizer matching the official UTR-LM 10-token alphabet."""
 

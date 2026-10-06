@@ -455,7 +455,7 @@ class IgLM(nn.Module):
 
 def training_step(model, batch, optimizer):
     """
-    Single training step for NOS-C
+    Single training step for IgLM
 
     Args:
         model: IgLM model

@@ -296,35 +296,6 @@ def heldout_distance_metrics(
     return out
 
 
-def elite_distance_metrics(
-    *,
-    generated_tokens,
-    start_tokens,
-    pool_tokens,
-    pool_scores: np.ndarray,
-    direction: float,
-    std_scale: float = 1.0,
-) -> Dict[str, float]:
-    """Alias of held-out distances under legacy ``elite_*`` CSV keys."""
-    held = heldout_distance_metrics(
-        generated_tokens=generated_tokens,
-        start_tokens=start_tokens,
-        pool_tokens=pool_tokens,
-        pool_scores=pool_scores,
-        direction=direction,
-        std_scale=std_scale,
-    )
-    return {
-        "elite_n": held["heldout_n"],
-        "elite_pool_n": held["heldout_pool_n"],
-        "elite_median": held["heldout_mean"],  # mean-based; key kept for CSV continuity
-        "elite_std_scale": float(std_scale),
-        "elite_nn_hamming_gen_mean": held["heldout_nn_hamming_gen_mean"],
-        "elite_nn_hamming_root_mean": held["heldout_nn_hamming_start_mean"],
-        "elite_w2_hamming": held["heldout_w2_hamming"],
-    }
-
-
 # ---------------------------------------------------------------------------
 # Biological heuristics
 # ---------------------------------------------------------------------------

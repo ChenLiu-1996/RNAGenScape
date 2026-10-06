@@ -5,40 +5,6 @@ from __future__ import annotations
 import torch
 
 
-def build_gaussian_graph(data, sigma=1.0):
-    """Build a graph using a Gaussian kernel from data points."""
-    if not isinstance(data, torch.Tensor):
-        data = torch.tensor(data, dtype=torch.float32)
-
-    diff = data.unsqueeze(1) - data.unsqueeze(0)
-    sq_distances = torch.sum(diff ** 2, dim=2)
-    adjacency_matrix = torch.exp(-sq_distances / (2 * sigma ** 2))
-    adjacency_matrix.fill_diagonal_(0)
-    return adjacency_matrix
-
-
-def gaussian_kernel_graph_adaptive_bandwidth(X, k=5):
-    """Gaussian kernel graph with adaptive bandwidth for each point."""
-    pairwise_distances = torch.cdist(X, X, p=2)
-    sorted_distances, _ = torch.sort(pairwise_distances, dim=1)
-    kth_distances = sorted_distances[:, k].unsqueeze(1)
-    adaptive_bandwidth = torch.sqrt(kth_distances @ kth_distances.T)
-    adjacency_matrix = torch.exp(-pairwise_distances ** 2 / (2 * adaptive_bandwidth ** 2))
-    adjacency_matrix.fill_diagonal_(0)
-    return adjacency_matrix
-
-
-def get_degree(data, bandwidth_type="fixed", sigma=1.0, k=5):
-    """Compute node degrees using either fixed or adaptive bandwidth."""
-    if bandwidth_type == "fixed":
-        graph = build_gaussian_graph(data, sigma)
-    elif bandwidth_type == "adaptive":
-        graph = gaussian_kernel_graph_adaptive_bandwidth(data, k)
-    else:
-        raise ValueError("bandwidth_type must be either 'fixed' or 'adaptive'")
-    return torch.sum(graph, dim=1)
-
-
 class GraphDegreeDensityEstimator:
     """Estimate node degrees for new points based on a fitted dataset."""
 
