@@ -36,6 +36,12 @@ The official version is hosted at the [Lab GitHub repo](https://github.com/Krish
 
 <br>
 
+#### Conceptual comparison
+
+<img src="assets/conceptual_comparison.png" width="800">
+
+<br>
+
 ## Environment
 
 Requires [uv](https://docs.astral.sh/uv/) and Python >= 3.12.
@@ -106,7 +112,13 @@ Datasets live under `data/` (gitignored; present on disk after setup).
 - RibosomeLoading: ~260k samples
 
 
-## Method overview
+## Experiments
+
+#### Experimental design
+
+<img src="assets/experimental_design.png" width="800">
+
+<br>
 
 The same procedure is used for each dataset (train / val / test split):
 
