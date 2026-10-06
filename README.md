@@ -12,7 +12,7 @@
   [![Google Scholar](https://img.shields.io/badge/Scholar-Xingzhi-4a86cf?logo=google-scholar&logoColor=white)](https://scholar.google.com/citations?user=tUvfTd8AAAAJ)
   <br>[![Twitter Follow](https://img.shields.io/twitter/follow/Danqi.svg?style=social)](https://x.com/DanqiLiao73090)
   [![Twitter Follow](https://img.shields.io/twitter/follow/Chen.svg?style=social)](https://x.com/ChenLiu_1996)
-  [![Twitter Follow](https://img.shields.io/twitter/follow/Xingzhi.svg?style=social)](https://x.com/https://x.com/XingzhiSun)
+  [![Twitter Follow](https://img.shields.io/twitter/follow/Xingzhi.svg?style=social)](https://x.com/XingzhiSun)
   [![Twitter Follow](https://img.shields.io/twitter/follow/KrishnaswamyLab.svg?style=social)](https://x.com/KrishnaswamyLab)
 
 </div>
@@ -87,9 +87,11 @@ pLDDT evaluation uses the public [ml4bio/RhoFold](https://github.com/ml4bio/RhoF
 ```bash
 # One-time setup (clones into external_src/, downloads checkpoint, installs Bio/etc.)
 bash bash/setup_rhofold.sh
-# Or: uv sync --extra rhofold
+# If RhoFold code and weights are already installed, only sync dependencies:
+# uv sync --extra rhofold
 
 # Or let eval auto-download the checkpoint once the source tree exists:
+# Requires saved generations for the specified experiment.
 python src/evaluation/eval_rhofold.py --dataset OpenVaccine --model DiffAb --experiment pos_guided
 ```
 
@@ -103,13 +105,24 @@ Override with `RHOFOLD_DIR` / `RHOFOLD_CKPT` or `--rhofold_dir` / `--ckpt` if yo
 
 ## Data
 
-Datasets live under `data/` (gitignored; present on disk after setup).
+Dataset loaders read the following paths relative to `data/`:
 
-**Primary experiment files:**
+| Dataset | Input file(s) | Sequence / label columns | Sequence length |
+|---|---|---|---:|
+| OpenVaccine | `OpenVaccine/train.csv` | `sequence` / `reactivity_mean` | 107 |
+| Zebrafish | `Zebrafish/MPRA_mean_translation_2hpf_pa_Fish5UTR.csv` | `sequence` / `translation` | 124 |
+| RibosomeLoading | `RibosomeLoading/MRL_Random50Nuc_SynthesisLibrary_Sample/4.10_train_data_GSM3130438_egfp_pseudo_2.csv` and `4.10_test_data_GSM3130438_egfp_pseudo_2.csv` in the same directory | `utr` / `rl` | 50 |
 
-- OpenVaccine: ~2k samples
-- Zebrafish: ~55k samples
-- RibosomeLoading: ~260k samples
+OpenVaccine and the RibosomeLoading train/test files are tracked. The large RibosomeLoading training CSV uses Git LFS; install Git LFS and retrieve the data after cloning:
+
+```bash
+git lfs install
+git lfs pull
+```
+
+The Zebrafish CSV must be supplied separately at the path above. `data/` is ignored for additional untracked files; this does not exclude data files already tracked by Git.
+
+OpenVaccine and Zebrafish use seeded 80% / 10% / 10% train/validation/test splits. RibosomeLoading uses the predefined train/test files (260,000 / 20,000 rows), with 15% of the training file reserved for validation. Label normalization is fitted on training labels and applied to validation and test labels.
 
 
 ## Experiments
@@ -118,12 +131,17 @@ Datasets live under `data/` (gitignored; present on disk after setup).
 
 <br>
 
-The same procedure is used for each dataset (train / val / test split):
+The workflow for each dataset is:
 
-1. **Oracle.** Fine-tune (or load) a property predictor and check it on the held-out test set. This model is used only for final evaluation, not for guiding generation.
-2. **Train RNAGenScape.** Fit the OAE on the training and validation sets (SUGAR to hole-fill the sparse manifolds). Train the manifold projector if it is a parameterized by a learnable DAE module (skip if using a kNN projector).
-3. **Generate.** Encode unseen test sequences, run fitness-guided Langevin in latent space with periodic manifold projection, and decode to new sequences.
-4. **Evaluate.** Score start vs. generated sequences with the frozen oracle (property improvement and related metrics).
+1. **Oracle.** Train or load a separate property predictor. Use validation for checkpoint selection and the held-out test set for evaluation. For RNAGenScape, this oracle evaluates generated sequences; the OAE's own property head guides generation.
+2. **Train the OAE.** Optimize the training split jointly for property prediction and sequence reconstruction. Validation selects the checkpoint and controls early stopping; it is not used for gradient updates.
+3. **Prepare the manifold projector.** Encode training sequences with the trained OAE. Optionally augment these latents with SUGAR (`sugar_w > 0`; default is off). Train a DAE projector, or cache the reference latents for a kNN projector. kNN has no trainable parameters but still requires this preparation step.
+4. **Generate.** Encode unseen test sequences, run property-guided Langevin updates in latent space, apply the selected projector after every step when projection is enabled, and decode the final latents to sequences.
+5. **Evaluate.** Score start and generated sequences with the oracle held fixed during evaluation. Report property changes, Hamming distances, novelty, held-out distances, and optional folding confidence.
+
+The default OAE is a deterministic residual convolutional autoencoder with 16 positional pooling bins and a 128-dimensional continuous latent vector. It has a sequence decoder and a property regression head, both operating on the same latent vector. Training minimizes `reg_w * MSE + recon_w * CE`, with defaults `reg_w=1` and `recon_w=5`. Checkpoint selection maximizes `0.5 * (val_pearson + val_spearman) + val_token_acc`.
+
+SUGAR augments the latent reference set for projector preparation; it does not train the OAE. Reconstruction is measured using both token accuracy and exact-sequence accuracy.
 
 
 ## Citation
