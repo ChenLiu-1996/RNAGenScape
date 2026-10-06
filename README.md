@@ -24,19 +24,19 @@ The official version is hosted at the [Lab GitHub repo](https://github.com/Krish
 
 <br>
 
-#### Why would we emphasize "on-manifold"?
+### Why would we emphasize "on-manifold"?
 
 <img src="assets/teaser.png" width="800">
 
 <br>
 
-#### Overview of the method
+### Overview of the method
 
 <img src="assets/schematic.png" width="800">
 
 <br>
 
-#### Conceptual comparison
+### Conceptual comparison
 
 <img src="assets/conceptual_comparison.png" width="800">
 
