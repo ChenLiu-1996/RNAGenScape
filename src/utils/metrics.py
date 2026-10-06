@@ -176,8 +176,8 @@ def novelty(sequences, reference_sequences) -> float:
     return 100.0 * n_novel / seqs.shape[0]
 
 
-def pairwise_edit_distance(start, generated) -> np.ndarray:
-    """Per-pair Hamming edit counts between start and generated token ids."""
+def pairwise_hamming_distance(start, generated) -> np.ndarray:
+    """Per-pair Hamming distances (mismatch counts) between start and generated token ids."""
     a = np.asarray(to_token_ids(start).cpu().numpy())
     b = np.asarray(to_token_ids(generated).cpu().numpy())
     if a.shape != b.shape:
@@ -511,9 +511,9 @@ def optimization_metrics(
         )
         metrics.update(manifold_distance(generated_embeddings, reference_embeddings))
 
-    edits = pairwise_edit_distance(start_ids, gen_ids)
-    metrics["mean_edit_distance"] = float(np.mean(edits))
-    metrics["median_edit_distance"] = float(np.median(edits))
+    hamming_distances = pairwise_hamming_distance(start_ids, gen_ids)
+    metrics["mean_hamming_distance"] = float(np.mean(hamming_distances))
+    metrics["median_hamming_distance"] = float(np.median(hamming_distances))
 
     held = heldout_distance_metrics(
         generated_tokens=generated_tokens,

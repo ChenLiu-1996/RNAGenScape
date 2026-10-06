@@ -46,8 +46,8 @@ OPTIMIZATION_SUMMARY_CORE: Tuple[Optional[Tuple[str, str, float]], ...] = (
     ("root_mfe_mean", "Minimum Free Energy (test data)", 1.0),
     ("root_mean_plddt", "Mean pLDDT (test data)", 1.0),
     None,
-    ("elite_nn_hamming_gen_mean", "Elite NN edit distance (generated)", 1.0),
-    ("elite_nn_hamming_root_mean", "Elite NN edit distance (test data)", 1.0),
+    ("elite_nn_hamming_gen_mean", "Elite NN Hamming distance (generated)", 1.0),
+    ("elite_nn_hamming_root_mean", "Elite NN Hamming distance (test data)", 1.0),
     None,
 )
 

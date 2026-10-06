@@ -1,10 +1,10 @@
-"""Evaluate property gain versus edit distance across experiment seeds.
+"""Evaluate property gain versus Hamming distance across experiment seeds.
 
 Example:
   python src/evaluation/eval_edit_efficiency.py \\
     --dataset OpenVaccine \\
     --model OAE \\
-    --experiment pos_samehyper_sugar0e0_dae \\
+    --experiment pos_sugar0e0_dae_T1e-3_ss1e-2_ns100 \\
     --oracle UTRLM
 """
 
@@ -24,7 +24,7 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from dataset import DATASET_CONFIG
-from utils.metrics import pairwise_edit_distance
+from utils.metrics import pairwise_hamming_distance
 from utils.oracle import (
     SUPPORTED_ORACLES,
     load_oracle,
@@ -65,7 +65,7 @@ def bin_stats(x: np.ndarray, y: np.ndarray, n_bins: int = 20):
 
 
 def make_plot(
-    edit: np.ndarray,
+    hamming: np.ndarray,
     prop_gain: np.ndarray,
     title: str,
     ylabel: str,
@@ -75,16 +75,16 @@ def make_plot(
     max_points: Optional[int],
 ) -> None:
     rng = np.random.default_rng(seed)
-    idx = np.arange(len(edit))
+    idx = np.arange(len(hamming))
     if max_points is not None and max_points < len(idx):
         idx = rng.choice(idx, size=max_points, replace=False)
     bin_x, bin_mean, bin_std, _ = bin_stats(
-        edit.astype(float), prop_gain, n_bins=n_bins
+        hamming.astype(float), prop_gain, n_bins=n_bins
     )
 
     fig, ax = plt.subplots(figsize=(7.5, 5.5))
     ax.scatter(
-        edit[idx],
+        hamming[idx],
         prop_gain[idx],
         s=8,
         alpha=0.18,
@@ -102,7 +102,7 @@ def make_plot(
         label="binned ±1 std",
     )
     ax.axhline(0.0, color="black", linewidth=1.0, linestyle="--", alpha=0.6)
-    ax.set_xlabel("Edit distance (Hamming count)", fontsize=13)
+    ax.set_xlabel("Hamming distance (mismatch count)", fontsize=13)
     ax.set_ylabel(ylabel, fontsize=13)
     ax.set_title(title, fontsize=12)
     ax.spines["top"].set_visible(False)
@@ -116,7 +116,7 @@ def make_plot(
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Evaluate edit efficiency across seeds.")
+    p = argparse.ArgumentParser(description="Evaluate hamming efficiency across seeds.")
     p.add_argument("--dataset", type=str, required=True, choices=sorted(DATASET_CONFIG.keys()))
     p.add_argument("--model", type=str, required=True)
     p.add_argument("--experiment", type=str, required=True)
@@ -163,26 +163,26 @@ def evaluate_one_seed(
     start_scores = np.asarray(start_scores, dtype=np.float64).reshape(-1)
     gen_scores = np.asarray(gen_scores, dtype=np.float64).reshape(-1)
     prop_gain = gen_scores - start_scores
-    edit = pairwise_edit_distance(start, generated).astype(np.float64)
+    hamming = pairwise_hamming_distance(start, generated).astype(np.float64)
 
     seed_dir = os.path.join(out_dir, f"seed_{seed}")
     os.makedirs(seed_dir, exist_ok=True)
     npz_path = os.path.join(seed_dir, f"edit_efficiency_{oracle_name}.npz")
     np.savez_compressed(
         npz_path,
-        edit_distance=edit,
+        hamming_distance=hamming,
         property_gain=prop_gain,
         start_fitness=start_scores,
         generated_fitness=gen_scores,
         direction=np.asarray(direction, dtype=np.float64),
     )
-    png_path = os.path.join(seed_dir, f"property_gain_vs_edit_{oracle_name}.png")
+    png_path = os.path.join(seed_dir, f"property_gain_vs_hamming_{oracle_name}.png")
     title = (
         f"{dataset}\n{artifact['model_type']}  seed={seed}  "
         f"dir={'pos' if direction > 0 else 'neg'}"
     )
     make_plot(
-        edit,
+        hamming,
         prop_gain,
         title,
         f"Property gain ({oracle_name})",
@@ -193,8 +193,8 @@ def evaluate_one_seed(
     )
 
     pearson = (
-        float(np.corrcoef(edit, prop_gain)[0, 1])
-        if edit.size > 1 and np.std(edit) > 0 and np.std(prop_gain) > 0
+        float(np.corrcoef(hamming, prop_gain)[0, 1])
+        if hamming.size > 1 and np.std(hamming) > 0 and np.std(prop_gain) > 0
         else float("nan")
     )
     row = {
@@ -203,22 +203,22 @@ def evaluate_one_seed(
         "dataset": dataset,
         "oracle": oracle_name,
         "direction": direction,
-        "n_sequences": float(edit.shape[0]),
-        "mean_edit_distance": float(np.mean(edit)),
-        "median_edit_distance": float(np.median(edit)),
+        "n_sequences": float(hamming.shape[0]),
+        "mean_hamming_distance": float(np.mean(hamming)),
+        "median_hamming_distance": float(np.median(hamming)),
         "mean_property_gain": float(np.mean(prop_gain)),
         "median_property_gain": float(np.median(prop_gain)),
-        "pearson_edit_prop_gain": pearson,
+        "pearson_hamming_prop_gain": pearson,
     }
     print(
-        f"[seed {seed}] edit mean={row['mean_edit_distance']:.2f} "
-        f"median={row['median_edit_distance']:.1f} | "
+        f"[seed {seed}] hamming mean={row['mean_hamming_distance']:.2f} "
+        f"median={row['median_hamming_distance']:.1f} | "
         f"prop_gain mean={row['mean_property_gain']:.4f} "
         f"median={row['median_property_gain']:.4f} | "
         f"pearson={pearson:.4f}"
     )
     print(f"[seed {seed}] wrote {npz_path}")
-    return row, edit, prop_gain
+    return row, hamming, prop_gain
 
 
 def main():
@@ -240,11 +240,11 @@ def main():
 
     oracle_model = load_oracle(args.oracle, args.dataset)
     rows: List[Dict] = []
-    all_edit: List[np.ndarray] = []
+    all_hamming: List[np.ndarray] = []
     all_gain: List[np.ndarray] = []
     for seed, run_dir in runs:
         print(f"[seed {seed}] scoring {run_dir} ...")
-        row, edit, prop_gain = evaluate_one_seed(
+        row, hamming, prop_gain = evaluate_one_seed(
             seed=seed,
             run_dir=run_dir,
             oracle_model=oracle_model,
@@ -256,7 +256,7 @@ def main():
             max_points=args.max_points,
         )
         rows.append(row)
-        all_edit.append(edit)
+        all_hamming.append(hamming)
         all_gain.append(prop_gain)
 
     per_seed_path = os.path.join(out_dir, f"edit_efficiency_per_seed_{args.oracle}.csv")
@@ -271,14 +271,14 @@ def main():
     print(f"Wrote {per_seed_path}")
     print(f"Wrote {summary_path}")
 
-    if all_edit:
-        pooled_edit = np.concatenate(all_edit, axis=0)
+    if all_hamming:
+        pooled_hamming = np.concatenate(all_hamming, axis=0)
         pooled_gain = np.concatenate(all_gain, axis=0)
         pooled_png = os.path.join(
-            out_dir, f"property_gain_vs_edit_pooled_{args.oracle}.png"
+            out_dir, f"property_gain_vs_hamming_pooled_{args.oracle}.png"
         )
         make_plot(
-            pooled_edit,
+            pooled_hamming,
             pooled_gain,
             f"{args.dataset}\n{args.model} / {args.experiment} (pooled seeds)",
             f"Property gain ({args.oracle})",
