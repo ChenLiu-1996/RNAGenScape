@@ -1,7 +1,8 @@
 """Evaluate held-out set distances across all seeds of an experiment.
 
 Paper metric: held-out pool = scores better than mean + direction * std.
-Reports NN Hamming (gen/start) and W2 Hamming to that set.
+Reports NN Hamming fractions and Levenshtein edit counts (gen/start),
+plus transport distances using each metric as the cost.
 
 Example:
   python src/evaluation/eval_heldout.py \\
@@ -53,11 +54,7 @@ def parse_args():
     p.add_argument("--latent_dim", type=int, default=128, help="For OAE path tag.")
     p.add_argument("--recon_w", type=float, default=5.0, help="For OAE path tag.")
     p.add_argument("--std_scale", type=float, default=1.0)
-    p.add_argument(
-        "--histogram",
-        action="store_true",
-        help="Save a histogram PNG of gen→heldout NN Hamming distances (pooled).",
-    )
+    p.add_argument("--histogram", action="store_true", help="Save pooled NN Hamming and edit-distance histograms.")
     p.add_argument("--bins", type=int, default=40, help="Histogram bins.")
     return p.parse_args()
 
@@ -71,7 +68,7 @@ def evaluate_one_seed(
     dataset: str,
     batch_size: int,
     std_scale: float,
-) -> tuple[dict, np.ndarray]:
+) -> tuple[dict, dict[str, np.ndarray]]:
     artifact = load_generation_artifact(run_dir)
     start = artifact["sampled_X"]
     generated = artifact["new_sequences"]
@@ -93,8 +90,12 @@ def evaluate_one_seed(
         direction=direction,
         std_scale=std_scale,
         return_gen_nn=True,
+        include_edit=True,
     )
-    gen_nn = np.asarray(held.pop("heldout_nn_hamming_gen"), dtype=np.float64)
+    gen_nn = {
+        metric: np.asarray(held.pop(f"heldout_nn_{metric}_gen"), dtype=np.float64)
+        for metric in ("hamming", "edit")
+    }
     row = dict(held)
     row["seed"] = seed
     row["run_dir"] = run_dir
@@ -123,7 +124,7 @@ def main():
 
     oracle_model = load_oracle(args.oracle, args.dataset)
     rows = []
-    all_gen_nn: list[np.ndarray] = []
+    all_gen_nn: dict[str, list[np.ndarray]] = {"hamming": [], "edit": []}
     for seed, run_dir in runs:
         print(f"[seed {seed}] scoring held-out distances for {run_dir} ...")
         row, gen_nn = evaluate_one_seed(
@@ -136,12 +137,16 @@ def main():
             std_scale=args.std_scale,
         )
         rows.append(row)
-        all_gen_nn.append(gen_nn)
+        for metric, values in gen_nn.items():
+            all_gen_nn[metric].append(values)
         print(
             f"[seed {seed}] heldout_n={int(row['heldout_n'])} "
-            f"nn_gen={row['heldout_nn_hamming_gen_mean']:.4f} "
-            f"nn_start={row['heldout_nn_hamming_start_mean']:.4f} "
-            f"w2={row['heldout_w2_hamming']:.4f}"
+            f"nn_hamming_gen={row['heldout_nn_hamming_gen_mean']:.4f} "
+            f"nn_hamming_start={row['heldout_nn_hamming_start_mean']:.4f} "
+            f"w2_hamming={row['heldout_w2_hamming']:.4f} "
+            f"nn_edit_gen={row['heldout_nn_edit_gen_mean']:.4f} "
+            f"nn_edit_start={row['heldout_nn_edit_start_mean']:.4f} "
+            f"w2_edit={row['heldout_w2_edit']:.4f}"
         )
 
     per_seed_path = os.path.join(out_dir, f"heldout_per_seed_{args.oracle}.csv")
@@ -156,12 +161,18 @@ def main():
     print(f"Wrote {per_seed_path}")
     print(f"Wrote {summary_path}")
 
-    if args.histogram and all_gen_nn:
-        pooled = np.concatenate([x for x in all_gen_nn if x.size > 0], axis=0)
+    for metric, batches in all_gen_nn.items():
+        nonempty = [x for x in batches if x.size > 0]
+        if not args.histogram or not nonempty:
+            continue
+        pooled = np.concatenate(nonempty, axis=0)
         if pooled.size > 0:
             fig, ax = plt.subplots(figsize=(7.0, 4.5))
             ax.hist(pooled, bins=args.bins, color="#4C78A8", alpha=0.85, edgecolor="white")
-            ax.set_xlabel("NN Hamming distance (generated → held-out)")
+            ax.set_xlabel(
+                "NN Hamming distance (mismatch fraction)" if metric == "hamming"
+                else "NN edit distance (Levenshtein count)"
+            )
             ax.set_ylabel("Count")
             ax.set_title(
                 f"{args.dataset} / {args.model} / {args.experiment}\n"
@@ -170,7 +181,8 @@ def main():
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
             fig.tight_layout()
-            hist_path = os.path.join(out_dir, f"heldout_nn_hist_{args.oracle}.png")
+            hist_path = os.path.join(out_dir, f"heldout_nn_hist_{args.oracle}.png" if metric == "hamming"
+                else f"heldout_nn_edit_hist_{args.oracle}.png")
             fig.savefig(hist_path, dpi=300)
             plt.close(fig)
             print(f"Wrote {hist_path}")

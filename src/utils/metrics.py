@@ -185,6 +185,41 @@ def pairwise_hamming_distance(start, generated) -> np.ndarray:
     return (a != b).sum(axis=-1).astype(np.int64)
 
 
+def pairwise_edit_distance(start, generated) -> np.ndarray:
+    """Return Levenshtein edit distances for corresponding sequence pairs.
+
+    Each single-nucleotide insertion, deletion, or substitution costs 1.
+    Unlike Hamming distance, this permits realignment and unequal lengths.
+    Accept strings, string batches, token ids, or one-hot sequences; remove
+    padding before comparison. Batches must contain the same number of
+    sequences. Return an int64 array of shape [N], not an all-pairs matrix.
+    Each pair takes O(L1 * L2) time and O(min(L1, L2)) working memory.
+    """
+    starts = _as_nucleotide_strings(start)
+    outputs = _as_nucleotide_strings(generated)
+    if len(starts) != len(outputs):
+        raise ValueError(
+            f"Batch size mismatch: start {len(starts)} vs generated {len(outputs)}"
+        )
+    distances = np.empty(len(starts), dtype=np.int64)
+    for i, (a, b) in enumerate(zip(starts, outputs)):
+        a, b = a.replace("<pad>", ""), b.replace("<pad>", "")
+        if len(a) < len(b):
+            a, b = b, a
+        previous = list(range(len(b) + 1))
+        for row, nucleotide_a in enumerate(a, start=1):
+            current = [row]
+            for col, nucleotide_b in enumerate(b, start=1):
+                current.append(min(
+                    previous[col] + 1,
+                    current[col - 1] + 1,
+                    previous[col - 1] + (nucleotide_a != nucleotide_b),
+                ))
+            previous = current
+        distances[i] = previous[-1]
+    return distances
+
+
 def wasserstein_distance(seq_a, seq_b, metric: str = "hamming") -> float:
     a = np.asarray(seq_a, dtype=np.float64)
     b = np.asarray(seq_b, dtype=np.float64)
@@ -242,6 +277,40 @@ def select_elite_mask(
     return (direction * (scores - mean)) > (std_scale * spread)
 
 
+def _edit_distance_matrix(query, reference) -> np.ndarray:
+    """Exact Levenshtein counts using a bit-vector recurrence per pair.
+
+    Python integers hold the full pattern, including sequences over 64 bases.
+    """
+    queries = [s.replace("<pad>", "") for s in _as_nucleotide_strings(query)]
+    references = [s.replace("<pad>", "") for s in _as_nucleotide_strings(reference)]
+    distances = np.empty((len(queries), len(references)), dtype=np.float64)
+    for i, pattern in enumerate(queries):
+        length = len(pattern)
+        if not length:
+            distances[i] = [len(s) for s in references]
+            continue
+        masks = {}
+        for pos, char in enumerate(pattern):
+            masks[char] = masks.get(char, 0) | (1 << pos)
+        top = 1 << (length - 1)
+        for j, sequence in enumerate(references):
+            positive, negative, score = ~0, 0, length
+            for char in sequence:
+                equal = masks.get(char, 0)
+                vertical = equal | negative
+                horizontal = (((equal & positive) + positive) ^ positive) | equal
+                plus = negative | ~(horizontal | positive)
+                minus = positive & horizontal
+                score += bool(plus & top) - bool(minus & top)
+                plus = (plus << 1) | 1
+                minus <<= 1
+                positive = minus | ~(vertical | plus)
+                negative = plus & vertical
+            distances[i, j] = score
+    return distances
+
+
 def heldout_distance_metrics(
     *,
     generated_tokens,
@@ -251,11 +320,14 @@ def heldout_distance_metrics(
     direction: float,
     std_scale: float = 1.0,
     return_gen_nn: bool = False,
+    include_edit: bool = False,
 ) -> Dict[str, Any]:
     """Distances from generated (and start) sequences to the held-out set.
 
     Held-out set = pool points better than ``mean + direction * std``
     (with ``std_scale`` multiplying the std term).
+    Hamming distances are mismatch fractions. With include_edit=True, also
+    report Levenshtein counts and transport using those counts as costs.
     """
     pool_scores = np.asarray(pool_scores, dtype=np.float64).reshape(-1)
     mask = select_elite_mask(pool_scores, direction=direction, std_scale=std_scale)
@@ -274,6 +346,12 @@ def heldout_distance_metrics(
         out["heldout_nn_hamming_gen_mean"] = float("nan")
         out["heldout_nn_hamming_start_mean"] = float("nan")
         out["heldout_w2_hamming"] = float("nan")
+        if include_edit:
+            out["heldout_nn_edit_gen_mean"] = float("nan")
+            out["heldout_nn_edit_start_mean"] = float("nan")
+            out["heldout_w2_edit"] = float("nan")
+            if return_gen_nn:
+                out["heldout_nn_edit_gen"] = np.zeros(0, dtype=np.float64)
         if return_gen_nn:
             out["heldout_nn_hamming_gen"] = np.zeros(0, dtype=np.float64)
         return out
@@ -293,6 +371,20 @@ def heldout_distance_metrics(
     )
     if return_gen_nn:
         out["heldout_nn_hamming_gen"] = gen_nn
+    if include_edit:
+        edit_cost = _edit_distance_matrix(generated_tokens, heldout_ids)
+        edit_nn = edit_cost.min(axis=1)
+        out["heldout_nn_edit_gen_mean"] = float(np.mean(edit_nn))
+        out["heldout_nn_edit_start_mean"] = float(np.mean(
+            _edit_distance_matrix(start_tokens, heldout_ids).min(axis=1)
+        ))
+        out["heldout_w2_edit"] = float(ot.emd2(
+            np.ones(edit_cost.shape[0]) / edit_cost.shape[0],
+            np.ones(edit_cost.shape[1]) / edit_cost.shape[1],
+            edit_cost,
+        ))
+        if return_gen_nn:
+            out["heldout_nn_edit_gen"] = edit_nn
     return out
 
 
