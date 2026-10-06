@@ -114,8 +114,6 @@ Datasets live under `data/` (gitignored; present on disk after setup).
 
 ## Experiments
 
-#### Experimental design
-
 <img src="assets/experimental_setup.png" width="800">
 
 <br>
