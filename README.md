@@ -110,7 +110,7 @@ Dataset loaders read the following paths relative to `data/`:
 | Dataset | Input file(s) | Sequence / label columns | Sequence length |
 |---|---|---|---:|
 | OpenVaccine | `OpenVaccine/train.csv` | `sequence` / `reactivity_mean` | 107 |
-| Zebrafish | `Zebrafish/MPRA_mean_translation_2hpf_pa_Fish5UTR.csv` | `sequence` / `translation` | 124 |
+| Zebrafish (proprietary; not included) | `Zebrafish/MPRA_mean_translation_2hpf_pa_Fish5UTR.csv` | `sequence` / `translation` | 124 |
 | RibosomeLoading | `RibosomeLoading/MRL_Random50Nuc_SynthesisLibrary_Sample/4.10_train_data_GSM3130438_egfp_pseudo_2.csv` and `4.10_test_data_GSM3130438_egfp_pseudo_2.csv` in the same directory | `utr` / `rl` | 50 |
 
 OpenVaccine and the RibosomeLoading train/test files are tracked. The large RibosomeLoading training CSV uses Git LFS; install Git LFS and retrieve the data after cloning:
