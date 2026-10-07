@@ -186,13 +186,15 @@ def pairwise_hamming_distance(start, generated) -> np.ndarray:
 
 
 def pairwise_edit_distance(start, generated) -> np.ndarray:
-    """Return Levenshtein edit distances for corresponding sequence pairs.
+    """Return normalized Levenshtein distances for corresponding sequence pairs.
 
     Each single-nucleotide insertion, deletion, or substitution costs 1.
     Unlike Hamming distance, this permits realignment and unequal lengths.
     Accept strings, string batches, token ids, or one-hot sequences; remove
     padding before comparison. Batches must contain the same number of
-    sequences. Return an int64 array of shape [N], not an all-pairs matrix.
+    sequences. Divide the edit count by the longer unpadded sequence length;
+    two empty sequences have distance 0. Return a float64 array in [0, 1]
+    of shape [N], not an all-pairs matrix.
     Each pair takes O(L1 * L2) time and O(min(L1, L2)) working memory.
     """
     starts = _as_nucleotide_strings(start)
@@ -201,7 +203,7 @@ def pairwise_edit_distance(start, generated) -> np.ndarray:
         raise ValueError(
             f"Batch size mismatch: start {len(starts)} vs generated {len(outputs)}"
         )
-    distances = np.empty(len(starts), dtype=np.int64)
+    distances = np.empty(len(starts), dtype=np.float64)
     for i, (a, b) in enumerate(zip(starts, outputs)):
         a, b = a.replace("<pad>", ""), b.replace("<pad>", "")
         if len(a) < len(b):
@@ -216,7 +218,7 @@ def pairwise_edit_distance(start, generated) -> np.ndarray:
                     previous[col - 1] + (nucleotide_a != nucleotide_b),
                 ))
             previous = current
-        distances[i] = previous[-1]
+        distances[i] = previous[-1] / max(len(a), len(b), 1)
     return distances
 
 
@@ -278,7 +280,9 @@ def select_elite_mask(
 
 
 def _edit_distance_matrix(query, reference) -> np.ndarray:
-    """Exact Levenshtein counts using a bit-vector recurrence per pair.
+    """Normalized Levenshtein distances using a bit-vector recurrence per pair.
+
+    Divide by max unpadded pair length; two empty sequences have distance 0.
 
     Python integers hold the full pattern, including sequences over 64 bases.
     """
@@ -288,7 +292,7 @@ def _edit_distance_matrix(query, reference) -> np.ndarray:
     for i, pattern in enumerate(queries):
         length = len(pattern)
         if not length:
-            distances[i] = [len(s) for s in references]
+            distances[i] = [float(bool(s)) for s in references]
             continue
         masks = {}
         for pos, char in enumerate(pattern):
@@ -307,7 +311,7 @@ def _edit_distance_matrix(query, reference) -> np.ndarray:
                 minus <<= 1
                 positive = minus | ~(vertical | plus)
                 negative = plus & vertical
-            distances[i, j] = score
+            distances[i, j] = score / max(length, len(sequence))
     return distances
 
 
@@ -327,7 +331,8 @@ def heldout_distance_metrics(
     Held-out set = pool points better than ``mean + direction * std``
     (with ``std_scale`` multiplying the std term).
     Hamming distances are mismatch fractions. With include_edit=True, also
-    report Levenshtein counts and transport using those counts as costs.
+    report normalized Levenshtein distances and transport using those
+    distances as costs. Both metrics and transport costs lie in [0, 1].
     """
     pool_scores = np.asarray(pool_scores, dtype=np.float64).reshape(-1)
     mask = select_elite_mask(pool_scores, direction=direction, std_scale=std_scale)

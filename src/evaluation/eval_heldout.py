@@ -1,7 +1,7 @@
 """Evaluate held-out set distances across all seeds of an experiment.
 
 Paper metric: held-out pool = scores better than mean + direction * std.
-Reports NN Hamming fractions and Levenshtein edit counts (gen/start),
+Reports NN Hamming fractions and normalized Levenshtein distances (gen/start),
 plus transport distances using each metric as the cost.
 
 Example:
@@ -171,7 +171,7 @@ def main():
             ax.hist(pooled, bins=args.bins, color="#4C78A8", alpha=0.85, edgecolor="white")
             ax.set_xlabel(
                 "NN Hamming distance (mismatch fraction)" if metric == "hamming"
-                else "NN edit distance (Levenshtein count)"
+                else "NN normalized edit distance (Levenshtein)"
             )
             ax.set_ylabel("Count")
             ax.set_title(
