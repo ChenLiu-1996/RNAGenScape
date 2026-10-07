@@ -4,7 +4,7 @@
 
   [![arXiv](https://img.shields.io/badge/arXiv-RNAGenScape-firebrick)](https://arxiv.org/abs/2510.24736)
   [![PDF](https://img.shields.io/badge/PDF-DADBDD)](https://arxiv.org/pdf/2510.24736)
-  [![GitHub Stars](https://img.shields.io/github/stars/KrishnaswamyLab/RNAGenScape.svg?style=social\&label=Stars)](https://github.com/KrishnaswamyLab/RNAGenScape)
+  [![GitHub Stars](https://img.shields.io/github/stars/ChenLiu-1996/RNAGenScape.svg?style=social\&label=Stars)](https://github.com/ChenLiu-1996/RNAGenScape)
   <br>[![LinkedIn](https://img.shields.io/badge/LinkedIn-Danqi-blue)](https://www.linkedin.com/in/danqi-liao-4852aba9/)
   [![LinkedIn](https://img.shields.io/badge/LinkedIn-Chen-blue)](https://www.linkedin.com/in/chenliu1996/)
   [![LinkedIn](https://img.shields.io/badge/LinkedIn-Xingzhi-blue)](https://www.linkedin.com/in/xingzhi-sun)
